@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+
+#include "parser.h"
+#include "exec.h"
 
 #define MAX_LINE 1024
 
@@ -9,6 +11,7 @@ int main() {
     char line[MAX_LINE];
 
     while (1) {
+
         printf("$ ");
         fflush(stdout);
 
@@ -16,19 +19,29 @@ int main() {
             break;
         }
 
-        // Remove newline character
+        // Remove newline
         line[strcspn(line, "\n")] = 0;
 
-        // Exit condition
+        // Exit command
         if (strcmp(line, "exit") == 0) {
             break;
         }
 
-        // For Day 1 we are not executing yet
-        // Just confirm shell loop works
-        if (strlen(line) > 0) {
-            printf("You entered: %s\n", line);
+        // Parse input
+        Pipeline *pipeline = parse_line(line);
+
+        // If empty input → just re-prompt
+        if (pipeline == NULL) {
+            continue;
         }
+
+        // Execute single command
+        run_command_basic(pipeline->commands[0].argv);
+
+        // Free allocated memory
+        free(pipeline->commands[0].argv);
+        free(pipeline->commands);
+        free(pipeline);
     }
 
     return 0;
