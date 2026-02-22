@@ -1,6 +1,8 @@
 #ifndef EXEC_H
 #define EXEC_H
 
-int run_command_basic(char *argv[]);
+#include "parser.h"
+
+int run_command_basic(Command *cmd);
 
 #endif
