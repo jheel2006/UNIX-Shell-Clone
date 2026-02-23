@@ -87,6 +87,12 @@ Pipeline* parse_line(char *line) {
     int capacity = 4;
     /* Number of commands parsed successfully so far. */
     int cmd_count = 0;
+    /*
+     * Tracks segments that contained only redirections and no executable.
+     * We defer reporting this so later segments can surface more specific
+     * errors (e.g., missing output target after '>').
+     */
+    int deferred_empty_segment = 0;
     Pipeline *pipeline;
 
     /*
@@ -229,6 +235,25 @@ Pipeline* parse_line(char *line) {
          * We treat this as a pipe syntax error in the current phase rules.
          */
         if (argc == 0) {
+            /*
+             * Special handling:
+             * If this segment had only redirections and there are more
+             * segments to parse, defer the "empty segment" error for now.
+             * This lets inputs like:
+             *   < input.txt | command1 >
+             * report the more specific:
+             *   Output file not specified.
+             * from the next segment, as required by the assignment.
+             */
+            if (cursor != NULL &&
+                (cmd->input_file != NULL ||
+                 cmd->output_file != NULL ||
+                 cmd->error_file != NULL)) {
+                deferred_empty_segment = 1;
+                free(cmd->argv);
+                continue;
+            }
+
             if (cursor == NULL) {
                 fprintf(stderr, "%s\n", ERR_MISSING_PIPE_COMMAND);
             } else {
@@ -246,6 +271,18 @@ Pipeline* parse_line(char *line) {
     }
 
     if (cmd_count == 0) {
+        free(pipeline->commands);
+        free(pipeline);
+        return NULL;
+    }
+
+    /*
+     * If we deferred an empty redirection-only segment but no later
+     * specific parser error occurred, report it as an empty pipe segment.
+     */
+    if (deferred_empty_segment) {
+        fprintf(stderr, "%s\n", ERR_EMPTY_PIPE);
+        free_commands(pipeline->commands, cmd_count);
         free(pipeline->commands);
         free(pipeline);
         return NULL;
