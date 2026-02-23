@@ -96,8 +96,19 @@ int execute_pipeline(Pipeline *pipeline) {
              *   cmd1 < in.txt | cmd2
              *   cmd1 | cmd2 > out.txt
              *   cmd1 | cmd2 2> err.log
+             *
+             * Why this order matters:
+             *   - First we connect the pipeline endpoints.
+             *   - Then we apply command-local redirection.
+             * If a command has both a pipe endpoint and file redirection
+             * for the same stream, the redirection should win because it
+             * is the explicit instruction for that specific command.
              */
             if (cmd->input_file != NULL) {
+                /*
+                 * Redirect this command's stdin from a file.
+                 * This can override input from a previous pipe stage.
+                 */
                 fd = open(cmd->input_file, O_RDONLY);
                 if (fd < 0) {
                     perror("open");
@@ -108,6 +119,10 @@ int execute_pipeline(Pipeline *pipeline) {
             }
 
             if (cmd->output_file != NULL) {
+                /*
+                 * Redirect this command's stdout to a file.
+                 * This can override output to the next pipe stage.
+                 */
                 fd = open(cmd->output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
                 if (fd < 0) {
                     perror("open");
@@ -118,6 +133,10 @@ int execute_pipeline(Pipeline *pipeline) {
             }
 
             if (cmd->error_file != NULL) {
+                /*
+                 * Redirect only stderr (fd 2). This is independent from
+                 * normal pipeline data flow, which uses stdin/stdout.
+                 */
                 fd = open(cmd->error_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
                 if (fd < 0) {
                     perror("open");
@@ -142,9 +161,17 @@ int execute_pipeline(Pipeline *pipeline) {
             /*
              * Replace child image with target command.
              * On success this never returns.
+             *
+             * On failure inside a pipeline, we print the specific
+             * pipeline error text required by the assignment.
+             *
+             * Note:
+             * Other stages in the pipeline may still continue and exit
+             * normally (e.g., a later "wc -l" can print 0), because each
+             * stage is an independent child process.
              */
             execvp(cmd->argv[0], cmd->argv);
-            fprintf(stderr, "%s\n", ERR_COMMAND_NOT_FOUND);
+            fprintf(stderr, "%s\n", ERR_COMMAND_IN_PIPE_SEQUENCE);
             _exit(EXIT_FAILURE);
         }
 
