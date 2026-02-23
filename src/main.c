@@ -4,6 +4,7 @@
 
 #include "parser.h"
 #include "exec.h"
+#include "pipes.h"
 
 /*
  * MAX_LINE
@@ -107,11 +108,32 @@ int main() {
             continue;
         }
 
-        // Execute the parsed command
-        run_command_basic(&pipeline->commands[0]);
+        /*
+         * Dispatch execution path:
+         *   - Single command: use existing basic executor.
+         *   - Multiple commands: execute as a real pipeline.
+         */
+        if (pipeline->num_commands == 1) {
+            /*
+             * Keep existing single-command path unchanged so
+             * redirection behavior remains exactly as before.
+             */
+            run_command_basic(&pipeline->commands[0]);
+        } else {
+            /*
+             * New multi-command path:
+             * execute all commands connected by '|'.
+             */
+            execute_pipeline(pipeline);
+        }
 
-        // Free Free dynamically allocated memory to prevent memory leaks.
-        free(pipeline->commands[0].argv);
+        /*
+         * Free every command's argv and then the container arrays.
+         * For pipelines, each command owns its own argv buffer.
+         */
+        for (int i = 0; i < pipeline->num_commands; i++) {
+            free(pipeline->commands[i].argv);
+        }
         free(pipeline->commands);
         free(pipeline);
     }
