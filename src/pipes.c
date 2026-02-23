@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 #include "pipes.h"
 #include "errors.h"
@@ -68,6 +69,8 @@ int execute_pipeline(Pipeline *pipeline) {
         }
 
         if (pids[i] == 0) {
+            int fd;
+
             /*
              * CHILD PROCESS
              * -------------
@@ -82,6 +85,46 @@ int execute_pipeline(Pipeline *pipeline) {
 
             if (i < pipeline->num_commands - 1) {
                 dup2(pipe_fd[1], STDOUT_FILENO);
+            }
+
+            /*
+             * Per-command redirections:
+             * These are applied after pipe dup2 calls so explicit
+             * redirection in the command takes precedence.
+             *
+             * Examples:
+             *   cmd1 < in.txt | cmd2
+             *   cmd1 | cmd2 > out.txt
+             *   cmd1 | cmd2 2> err.log
+             */
+            if (cmd->input_file != NULL) {
+                fd = open(cmd->input_file, O_RDONLY);
+                if (fd < 0) {
+                    perror("open");
+                    _exit(EXIT_FAILURE);
+                }
+                dup2(fd, STDIN_FILENO);
+                close(fd);
+            }
+
+            if (cmd->output_file != NULL) {
+                fd = open(cmd->output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) {
+                    perror("open");
+                    _exit(EXIT_FAILURE);
+                }
+                dup2(fd, STDOUT_FILENO);
+                close(fd);
+            }
+
+            if (cmd->error_file != NULL) {
+                fd = open(cmd->error_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) {
+                    perror("open");
+                    _exit(EXIT_FAILURE);
+                }
+                dup2(fd, STDERR_FILENO);
+                close(fd);
             }
 
             /*
