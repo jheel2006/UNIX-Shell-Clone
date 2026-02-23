@@ -6,6 +6,7 @@
 #define ERR_MISSING_ERROR_FILE "Error output file not specified."
 #define ERR_MISSING_PIPE_COMMAND "Command missing after pipe."
 #define ERR_EMPTY_PIPE "Empty command between pipes."
+#define ERR_COMMAND_IN_PIPE_SEQUENCE "Invalid command in pipe sequence."
 #define ERR_COMMAND_NOT_FOUND "Command not found."
 
 #endif
