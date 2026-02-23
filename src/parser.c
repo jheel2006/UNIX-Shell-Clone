@@ -13,16 +13,59 @@
 
 #define MAX_TOKENS 100
 
+/*
+ * trim_whitespace
+ * ---------------
+ * Trims leading/trailing spaces and tabs in-place and
+ * returns the first non-whitespace character.
+ */
+static char *trim_whitespace(char *s) {
+    char *end;
+
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+
+    if (*s == '\0') {
+        return s;
+    }
+
+    end = s + strlen(s) - 1;
+    while (end > s && (*end == ' ' || *end == '\t')) {
+        *end = '\0';
+        end--;
+    }
+
+    return s;
+}
+
+/*
+ * free_commands
+ * -------------
+ * Frees argv buffers for commands [0, count).
+ * Used on parser error paths.
+ */
+static void free_commands(Command *commands, int count) {
+    int i;
+
+    if (commands == NULL) {
+        return;
+    }
+
+    for (i = 0; i < count; i++) {
+        free(commands[i].argv);
+    }
+}
 
 /*
  * parse_line
  * ----------
- * Parses a single command line (no pipes yet)
- * and constructs a Pipeline structure containing
- * exactly one Command.
+ * Parses a command line that may include one or more
+ * commands connected by pipes.
  *
  * Responsibilities:
- *   - Tokenize input by spaces
+ *   - Split input by pipe delimiter '|'
+ *   - Tokenize each command by spaces/tabs
  *   - Detect redirection operators (<, >, 2>)
  *   - Store filenames for redirection
  *   - Build argv[] array for execvp()
@@ -33,6 +76,18 @@
  *   - NULL if input is empty or syntax error occurs
  */
 Pipeline* parse_line(char *line) {
+    /*
+     * cursor walks across the full input line while strsep()
+     * extracts one pipe segment at a time.
+     */
+    char *cursor;
+    /* Raw command segment between two '|' delimiters. */
+    char *segment;
+    /* Dynamic capacity for pipeline->commands array. */
+    int capacity = 4;
+    /* Number of commands parsed successfully so far. */
+    int cmd_count = 0;
+    Pipeline *pipeline;
 
     /*
      * If user pressed Enter without typing anything,
@@ -42,165 +97,161 @@ Pipeline* parse_line(char *line) {
         return NULL;
     }
 
-    /*
-     * Allocate memory for Pipeline structure.
-     * This represents the entire command line.
-     */
-    Pipeline *pipeline = malloc(sizeof(Pipeline));
+    pipeline = malloc(sizeof(Pipeline));
     if (!pipeline) return NULL;
 
-    pipeline->num_commands = 1;
-
-    /*
-     * Allocate memory for exactly one Command.
-     */
-    pipeline->commands = malloc(sizeof(Command));
+    pipeline->commands = malloc(sizeof(Command) * capacity);
     if (!pipeline->commands) return NULL;
 
-    Command *cmd = &pipeline->commands[0];
-
+    cursor = line;
     /*
-     * Initialize redirection pointers to NULL.
-     * If no redirection is provided,
-     * executor will skip those sections.
+     * Split the line by '|'. Each segment is parsed into one Command.
      */
-    cmd->input_file = NULL;
-    cmd->output_file = NULL;
-    cmd->error_file = NULL;
-
-    /*
-     * Allocate memory for argument vector (argv).
-     * execvp() requires argv to be NULL-terminated.
-     */
-    cmd->argv = malloc(sizeof(char*) * MAX_TOKENS);
-    if (!cmd->argv) return NULL;
-
-    int argc = 0;
-
-     /*
-     * Tokenize input using space delimiter.
-     * strtok modifies the original string.
-     */
-    char *token = strtok(line, " ");
-
-    while (token != NULL) {
+    while ((segment = strsep(&cursor, "|")) != NULL) {
+        Command *cmd;
+        char *token;
+        char *save_token = NULL;
+        /* argc counts executable + arguments for this command only. */
+        int argc = 0;
+        char *trimmed = trim_whitespace(segment);
 
         /*
-         * ==========================
-         * INPUT REDIRECTION (<)
-         * ==========================
-         *
-         * If token is "<", the next token
-         * must be a valid filename.
+         * Reject empty segments:
+         *   "cmd1 |"            -> missing command after pipe
+         *   "cmd1 | | cmd2"     -> empty command between pipes
          */
-        if (strcmp(token, "<") == 0) {
+        if (*trimmed == '\0') {
+            if (cursor == NULL) {
+                fprintf(stderr, "%s\n", ERR_MISSING_PIPE_COMMAND);
+            } else {
+                fprintf(stderr, "%s\n", ERR_EMPTY_PIPE);
+            }
+            free_commands(pipeline->commands, cmd_count);
+            free(pipeline->commands);
+            free(pipeline);
+            return NULL;
+        }
 
-            token = strtok(NULL, " ");
-
-            /*
-             * Syntax validation:
-             * - No filename provided
-             * - Next token is another operator
-             */
-            if (token == NULL ||
-                strcmp(token, "<") == 0 ||
-                strcmp(token, ">") == 0 ||
-                strcmp(token, "2>") == 0) {
-
-                fprintf(stderr, "%s\n", ERR_MISSING_INPUT);
-                free(cmd->argv);
+        if (cmd_count == capacity) {
+            Command *new_commands;
+            /* Grow command array geometrically for scalability. */
+            capacity *= 2;
+            new_commands = realloc(pipeline->commands, sizeof(Command) * capacity);
+            if (new_commands == NULL) {
+                free_commands(pipeline->commands, cmd_count);
                 free(pipeline->commands);
                 free(pipeline);
                 return NULL;
             }
+            pipeline->commands = new_commands;
+        }
 
-            cmd->input_file = token;
+        cmd = &pipeline->commands[cmd_count];
+        /*
+         * Reset redirection fields for this command.
+         * Each command tracks its own local redirections.
+         */
+        cmd->input_file = NULL;
+        cmd->output_file = NULL;
+        cmd->error_file = NULL;
+        cmd->argv = malloc(sizeof(char*) * MAX_TOKENS);
+        if (cmd->argv == NULL) {
+            free_commands(pipeline->commands, cmd_count);
+            free(pipeline->commands);
+            free(pipeline);
+            return NULL;
         }
 
         /*
-         * ==========================
-         * OUTPUT REDIRECTION (>)
-         * ==========================
+         * Tokenize one command segment.
+         * Delimiters include both spaces and tabs.
          */
-        else if (strcmp(token, ">") == 0) {
+        token = strtok_r(trimmed, " \t", &save_token);
+        while (token != NULL) {
+            if (strcmp(token, "<") == 0) {
+                /* '<' requires a following filename token. */
+                token = strtok_r(NULL, " \t", &save_token);
+                if (token == NULL ||
+                    strcmp(token, "<") == 0 ||
+                    strcmp(token, ">") == 0 ||
+                    strcmp(token, "2>") == 0) {
 
-            token = strtok(NULL, " ");
+                    fprintf(stderr, "%s\n", ERR_MISSING_INPUT);
+                    free_commands(pipeline->commands, cmd_count + 1);
+                    free(pipeline->commands);
+                    free(pipeline);
+                    return NULL;
+                }
+                cmd->input_file = token;
+            } else if (strcmp(token, ">") == 0) {
+                /* '>' requires a following output filename token. */
+                token = strtok_r(NULL, " \t", &save_token);
+                if (token == NULL ||
+                    strcmp(token, "<") == 0 ||
+                    strcmp(token, ">") == 0 ||
+                    strcmp(token, "2>") == 0) {
 
-            if (token == NULL ||
-                strcmp(token, "<") == 0 ||
-                strcmp(token, ">") == 0 ||
-                strcmp(token, "2>") == 0) {
+                    fprintf(stderr, "%s\n", ERR_MISSING_OUTPUT);
+                    free_commands(pipeline->commands, cmd_count + 1);
+                    free(pipeline->commands);
+                    free(pipeline);
+                    return NULL;
+                }
+                cmd->output_file = token;
+            } else if (strcmp(token, "2>") == 0) {
+                /* '2>' requires a following stderr filename token. */
+                token = strtok_r(NULL, " \t", &save_token);
+                if (token == NULL ||
+                    strcmp(token, "<") == 0 ||
+                    strcmp(token, ">") == 0 ||
+                    strcmp(token, "2>") == 0) {
 
-                fprintf(stderr, "%s\n", ERR_MISSING_OUTPUT);
-                free(cmd->argv);
-                free(pipeline->commands);
-                free(pipeline);
-                return NULL;
+                    fprintf(stderr, "%s\n", ERR_MISSING_ERROR_FILE);
+                    free_commands(pipeline->commands, cmd_count + 1);
+                    free(pipeline->commands);
+                    free(pipeline);
+                    return NULL;
+                }
+                cmd->error_file = token;
+            } else {
+                /*
+                 * Normal argument token.
+                 * First one becomes argv[0] (program name).
+                 */
+                cmd->argv[argc++] = token;
             }
 
-            cmd->output_file = token;
+            token = strtok_r(NULL, " \t", &save_token);
         }
 
-
         /*
-         * ==========================
-         * ERROR REDIRECTION (2>)
-         * ==========================
+         * Reject segments that contain only redirections and no command.
+         * We treat this as a pipe syntax error in the current phase rules.
          */
-        else if (strcmp(token, "2>") == 0) {
-
-            token = strtok(NULL, " ");
-
-            if (token == NULL ||
-                strcmp(token, "<") == 0 ||
-                strcmp(token, ">") == 0 ||
-                strcmp(token, "2>") == 0) {
-
-                fprintf(stderr, "%s\n", ERR_MISSING_ERROR_FILE);
-                free(cmd->argv);
-                free(pipeline->commands);
-                free(pipeline);
-                return NULL;
+        if (argc == 0) {
+            if (cursor == NULL) {
+                fprintf(stderr, "%s\n", ERR_MISSING_PIPE_COMMAND);
+            } else {
+                fprintf(stderr, "%s\n", ERR_EMPTY_PIPE);
             }
-
-            cmd->error_file = token;
+            free_commands(pipeline->commands, cmd_count + 1);
+            free(pipeline->commands);
+            free(pipeline);
+            return NULL;
         }
 
-
-        /*
-         * ==========================
-         * NORMAL ARGUMENT
-         * ==========================
-         *
-         * Any token that is not a redirection
-         * operator is considered part of argv.
-         *
-         * These will be passed directly to execvp().
-         */
-        else {
-            cmd->argv[argc++] = token;
-        }
-
-        token = strtok(NULL, " ");
+        cmd->argv[argc] = NULL;
+        /* Command fully parsed successfully. */
+        cmd_count++;
     }
 
-    /*
-     * argv must always be NULL-terminated
-     * for execvp() to function correctly.
-     */
-    cmd->argv[argc] = NULL;
-
-
-    /*
-     * If no executable was provided (e.g. only "< file"),
-     * this is invalid. Do not execute.
-     */
-    if (argc == 0) {
-        free(cmd->argv);
+    if (cmd_count == 0) {
         free(pipeline->commands);
         free(pipeline);
         return NULL;
     }
 
+    /* Final parsed pipeline descriptor consumed by execution layer. */
+    pipeline->num_commands = cmd_count;
     return pipeline;
 }
