@@ -46,16 +46,141 @@ static char *trim_whitespace(char *s) {
  * Used on parser error paths.
  */
 static void free_commands(Command *commands, int count) {
-    int i;
+    int i, j;
 
-    if (commands == NULL) {
-        return;
-    }
+    if (commands == NULL) return;
 
     for (i = 0; i < count; i++) {
-        free(commands[i].argv);
+
+        if (commands[i].argv != NULL) {
+            for (j = 0; commands[i].argv[j] != NULL; j++) {
+                free(commands[i].argv[j]);
+            }
+            free(commands[i].argv);
+        }
+
+        if (commands[i].input_file)
+            free(commands[i].input_file);
+
+        if (commands[i].output_file)
+            free(commands[i].output_file);
+
+        if (commands[i].error_file)
+            free(commands[i].error_file);
     }
 }
+
+
+/*
+ * next_token
+ * ----------
+ * Extracts the next token from *input.
+ * Supports grouping by single and double quotes.
+ * Modifies input pointer to advance position.
+ */
+static char *next_token(char **input) {
+    static char buffer[4096];
+    int i = 0;
+
+    char *p = *input;
+
+    /* Skip leading whitespace */
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    if (*p == '\0') {
+        *input = p;
+        return NULL;
+    }
+
+    enum { OUTSIDE, IN_SINGLE, IN_DOUBLE } state = OUTSIDE;
+
+    while (*p) {
+
+        /* OUTSIDE QUOTES */
+        if (state == OUTSIDE) {
+
+            if (*p == ' ' || *p == '\t') {
+                break;
+            }
+
+            else if (*p == '\'') {
+                state = IN_SINGLE;
+                p++;
+            }
+
+            else if (*p == '"') {
+                state = IN_DOUBLE;
+                p++;
+            }
+
+            else if (*p == '\\') {
+                /* Escape next character */
+                p++;
+                if (*p) {
+                    buffer[i++] = *p++;
+                }
+            }
+
+            else {
+                buffer[i++] = *p++;
+            }
+        }
+
+        /* INSIDE SINGLE QUOTES */
+        else if (state == IN_SINGLE) {
+
+            if (*p == '\'') {
+                state = OUTSIDE;
+                p++;
+            } else {
+                buffer[i++] = *p++;
+            }
+        }
+
+        /* INSIDE DOUBLE QUOTES */
+        else if (state == IN_DOUBLE) {
+
+            if (*p == '"') {
+                state = OUTSIDE;
+                p++;
+            }
+
+            else if (*p == '\\') {
+                p++;
+                if (*p == 'n') {
+                    buffer[i++] = '\n';
+                    p++;
+                }
+                else if (*p == '"' || *p == '\\') {
+                    buffer[i++] = *p++;
+                }
+                else {
+                    /* Unknown escape, keep literal */
+                    buffer[i++] = '\\';
+                }
+            }
+
+            else {
+                buffer[i++] = *p++;
+            }
+        }
+    }
+
+    buffer[i] = '\0';
+
+    if (state != OUTSIDE) {
+        fprintf(stderr, "Unmatched quote");
+        return NULL;
+    }
+
+    *input = p;
+
+    return buffer;
+}
+
+
 
 /*
  * parse_line
@@ -96,12 +221,15 @@ Pipeline* parse_line(char *line) {
     Pipeline *pipeline;
 
     /*
-     * If user pressed Enter without typing anything,
+     * If user pressed Enter without typing anything or only types spaces,
      * return NULL so the shell simply re-prompts.
      */
-    if (line == NULL || strlen(line) == 0) {
-        return NULL;
-    }
+    if (line == NULL) return NULL;
+
+    char *trimmed_line = trim_whitespace(line);
+
+    if (*trimmed_line == '\0') return NULL;
+    
 
     pipeline = malloc(sizeof(Pipeline));
     if (!pipeline) return NULL;
@@ -116,7 +244,7 @@ Pipeline* parse_line(char *line) {
     while ((segment = strsep(&cursor, "|")) != NULL) {
         Command *cmd;
         char *token;
-        char *save_token = NULL;
+        // char *save_token = NULL;
         /* argc counts executable + arguments for this command only. */
         int argc = 0;
         char *trimmed = trim_whitespace(segment);
@@ -172,11 +300,12 @@ Pipeline* parse_line(char *line) {
          * Tokenize one command segment.
          * Delimiters include both spaces and tabs.
          */
-        token = strtok_r(trimmed, " \t", &save_token);
-        while (token != NULL) {
+        // token = strtok_r(trimmed, " \t", &save_token);
+        char *scan = trimmed;
+        while ((token = next_token(&scan)) != NULL) {
             if (strcmp(token, "<") == 0) {
                 /* '<' requires a following filename token. */
-                token = strtok_r(NULL, " \t", &save_token);
+                token = next_token(&scan);
                 if (token == NULL ||
                     strcmp(token, "<") == 0 ||
                     strcmp(token, ">") == 0 ||
@@ -188,10 +317,10 @@ Pipeline* parse_line(char *line) {
                     free(pipeline);
                     return NULL;
                 }
-                cmd->input_file = token;
+                cmd->input_file = strdup(token);
             } else if (strcmp(token, ">") == 0) {
                 /* '>' requires a following output filename token. */
-                token = strtok_r(NULL, " \t", &save_token);
+                token = next_token(&scan);
                 if (token == NULL ||
                     strcmp(token, "<") == 0 ||
                     strcmp(token, ">") == 0 ||
@@ -203,10 +332,10 @@ Pipeline* parse_line(char *line) {
                     free(pipeline);
                     return NULL;
                 }
-                cmd->output_file = token;
+                cmd->output_file = strdup(token);
             } else if (strcmp(token, "2>") == 0) {
                 /* '2>' requires a following stderr filename token. */
-                token = strtok_r(NULL, " \t", &save_token);
+                token = next_token(&scan);
                 if (token == NULL ||
                     strcmp(token, "<") == 0 ||
                     strcmp(token, ">") == 0 ||
@@ -218,16 +347,16 @@ Pipeline* parse_line(char *line) {
                     free(pipeline);
                     return NULL;
                 }
-                cmd->error_file = token;
+                cmd->error_file = strdup(token);
             } else {
                 /*
                  * Normal argument token.
                  * First one becomes argv[0] (program name).
                  */
-                cmd->argv[argc++] = token;
+                cmd->argv[argc++] = strdup(token);
             }
 
-            token = strtok_r(NULL, " \t", &save_token);
+            // token = strtok_r(NULL, " \t", &save_token);
         }
 
         /*
