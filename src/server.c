@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -32,6 +33,28 @@
 #define BUFFER_SIZE 1024
 
 /*
+ * send_all
+ * --------
+ * Sends an entire buffer over the connected socket, retrying until all
+ * bytes are written or a hard error occurs.
+ */
+static int send_all(int socket_fd, const void *buffer, size_t length) {
+    const char *cursor = buffer;
+    size_t total_sent = 0;
+    ssize_t sent_now;
+
+    while (total_sent < length) {
+        sent_now = send(socket_fd, cursor + total_sent, length - total_sent, 0);
+        if (sent_now <= 0) {
+            return -1;
+        }
+        total_sent += (size_t) sent_now;
+    }
+
+    return 0;
+}
+
+/*
  * main
  * ----
  * Phase 2 server for the command-send milestone.
@@ -41,7 +64,8 @@
  *   2. Accept one client connection
  *   3. Receive one raw shell command string
  *   4. Pass that command into the shared Phase 1 shell engine
- *   5. Send back an acknowledgement after execution completes
+ *   5. Capture the resulting stdout/stderr text
+ *   6. Send that captured output back to the client
  *   6. Close sockets cleanly
  *
  * This branch intentionally reuses shell_execute_line() from shell_core
@@ -53,8 +77,10 @@ int main(void) {
     int client_socket;
     int addrlen;
     ssize_t bytes_received;
+    size_t output_size;
     char command[BUFFER_SIZE];
-    char response[BUFFER_SIZE];
+    char *captured_output;
+    uint32_t network_output_size;
     struct sockaddr_in server_address;
 
     /*
@@ -155,35 +181,40 @@ int main(void) {
     printf("[SERVER] Executing command: \"%s\"\n", command);
 
     /*
-     * Reuse the shared Phase 1 execution path directly.
-     * This means the same parser, single-command execution logic,
-     * and pipeline execution logic already used by myshell also
-     * drive remote command handling on the server side.
-     *
-     * In this branch, stdout/stderr still go to the server terminal.
-     * Returning actual command output to the client is deferred to
-     * the next milestone, where execution output will be captured.
+     * Reuse the shared Phase 1 execution path directly, but this time
+     * capture both stdout and stderr so they can be sent back over the
+     * socket and displayed on the client side.
      */
-    shell_execute_line(command);
+    shell_execute_line_capture(command, &captured_output, &output_size);
 
     /*
-     * Keep the client-side flow alive by returning a short
-     * acknowledgement message after the shared shell engine runs.
+     * Send a fixed-size length header first so the client knows how many
+     * bytes of command output to read next. This supports both long output
+     * and empty-output commands without relying on connection close timing.
      */
-    snprintf(response,
-             sizeof(response),
-             "[CLIENT] Server executed command: \"%s\"",
-             command);
-
-    if (send(client_socket, response, strlen(response) + 1, 0) == -1) {
+    network_output_size = htonl((uint32_t) output_size);
+    if (send_all(client_socket,
+                 &network_output_size,
+                 sizeof(network_output_size)) == -1) {
         perror("send");
+        free(captured_output);
         close(client_socket);
         close(server_socket);
         return EXIT_FAILURE;
     }
 
-    printf("[SERVER] Sent execution acknowledgement to client.\n");
+    if (output_size > 0 &&
+        send_all(client_socket, captured_output, output_size) == -1) {
+        perror("send");
+        free(captured_output);
+        close(client_socket);
+        close(server_socket);
+        return EXIT_FAILURE;
+    }
 
+    printf("[SERVER] Sent %zu bytes of command output to client.\n", output_size);
+
+    free(captured_output);
     close(client_socket);
     close(server_socket);
 
