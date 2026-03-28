@@ -234,8 +234,11 @@ Pipeline* parse_line(char *line) {
     pipeline = malloc(sizeof(Pipeline));
     if (!pipeline) return NULL;
 
-    pipeline->commands = malloc(sizeof(Command) * capacity);
-    if (!pipeline->commands) return NULL;
+    pipeline->commands = calloc(capacity, sizeof(Command));
+    if (!pipeline->commands) {
+        free(pipeline);
+        return NULL;
+    }
 
     cursor = line;
     /*
@@ -268,6 +271,7 @@ Pipeline* parse_line(char *line) {
 
         if (cmd_count == capacity) {
             Command *new_commands;
+            int old_capacity = capacity;
             /* Grow command array geometrically for scalability. */
             capacity *= 2;
             new_commands = realloc(pipeline->commands, sizeof(Command) * capacity);
@@ -278,6 +282,8 @@ Pipeline* parse_line(char *line) {
                 return NULL;
             }
             pipeline->commands = new_commands;
+            memset(&pipeline->commands[old_capacity], 0,
+                   sizeof(Command) * (capacity - old_capacity));
         }
 
         cmd = &pipeline->commands[cmd_count];
@@ -288,7 +294,7 @@ Pipeline* parse_line(char *line) {
         cmd->input_file = NULL;
         cmd->output_file = NULL;
         cmd->error_file = NULL;
-        cmd->argv = malloc(sizeof(char*) * MAX_TOKENS);
+        cmd->argv = calloc(MAX_TOKENS, sizeof(char *));
         if (cmd->argv == NULL) {
             free_commands(pipeline->commands, cmd_count);
             free(pipeline->commands);
