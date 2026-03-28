@@ -304,8 +304,6 @@ int main(void) {
             return EXIT_FAILURE;
         }
 
-        printf("[INFO] Sent %zu bytes to client.\n", output_size);
-
         free(captured_output);
 
         if (exit_requested) {
