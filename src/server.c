@@ -28,9 +28,25 @@
 /*
  * BUFFER_SIZE
  * -----------
- * Maximum size of one received command and one acknowledgement reply.
+ * Maximum size of one received command string.
  */
 #define BUFFER_SIZE 1024
+
+/*
+ * SERVER_CONTINUE
+ * ---------------
+ * Response status sent after normal command processing when the server
+ * should remain connected and wait for another command from the client.
+ */
+#define SERVER_CONTINUE 0U
+
+/*
+ * SERVER_EXIT
+ * -----------
+ * Response status sent when the received command requests a clean
+ * end to the remote shell session.
+ */
+#define SERVER_EXIT 1U
 
 /*
  * send_all
@@ -55,18 +71,55 @@ static int send_all(int socket_fd, const void *buffer, size_t length) {
 }
 
 /*
+ * send_response
+ * -------------
+ * Sends one complete response packet for a command:
+ *   1. 32-bit status code
+ *   2. 32-bit payload length
+ *   3. payload bytes
+ *
+ * This packet format lets the server keep the socket open across
+ * multiple commands while still allowing the client to determine
+ * where each response ends.
+ */
+static int send_response(int client_socket,
+                         uint32_t status,
+                         const char *payload,
+                         size_t payload_size) {
+    uint32_t network_status = htonl(status);
+    uint32_t network_payload_size = htonl((uint32_t) payload_size);
+
+    if (send_all(client_socket, &network_status, sizeof(network_status)) == -1) {
+        return -1;
+    }
+
+    if (send_all(client_socket,
+                 &network_payload_size,
+                 sizeof(network_payload_size)) == -1) {
+        return -1;
+    }
+
+    if (payload_size > 0 &&
+        send_all(client_socket, payload, payload_size) == -1) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
  * main
  * ----
- * Phase 2 server for the command-send milestone.
+ * Phase 2 server for the persistent-session milestone.
  *
  * Responsibilities in this branch:
  *   1. Create, bind, and listen on a TCP socket
  *   2. Accept one client connection
- *   3. Receive one raw shell command string
- *   4. Pass that command into the shared Phase 1 shell engine
- *   5. Capture the resulting stdout/stderr text
- *   6. Send that captured output back to the client
- *   6. Close sockets cleanly
+ *   3. Repeatedly receive commands over the same connection
+ *   4. Pass each command into the shared Phase 1 shell engine
+ *   5. Send the resulting output/error text back to the client
+ *   6. Stop only on disconnect or clean "exit"
+ *   7. Close sockets cleanly
  *
  * This branch intentionally reuses shell_execute_line() from shell_core
  * so the server does not duplicate parser/executor logic locally.
@@ -77,10 +130,7 @@ int main(void) {
     int client_socket;
     int addrlen;
     ssize_t bytes_received;
-    size_t output_size;
     char command[BUFFER_SIZE];
-    char *captured_output;
-    uint32_t network_output_size;
     struct sockaddr_in server_address;
 
     /*
@@ -156,68 +206,69 @@ int main(void) {
 
     printf("[SERVER] Client connected successfully.\n");
 
-    /*
-     * Receive one raw command string from the client.
-     * The client sends the trailing '\0', so the server can
-     * print the command exactly as a normal C string.
-     */
-    memset(command, 0, sizeof(command));
-    bytes_received = recv(client_socket, command, sizeof(command) - 1, 0);
-    if (bytes_received == -1) {
-        perror("recv");
-        close(client_socket);
-        close(server_socket);
-        return EXIT_FAILURE;
-    }
+    while (1) {
+        char *captured_output;
+        size_t output_size;
+        int exit_requested;
 
-    if (bytes_received == 0) {
-        fprintf(stderr, "[SERVER] Client disconnected before sending a command.\n");
-        close(client_socket);
-        close(server_socket);
-        return EXIT_FAILURE;
-    }
+        /*
+         * Receive the next raw command string from the same connected client.
+         * Each command is still sent as a null-terminated string so the server
+         * can log it directly without extra parsing at the transport layer.
+         */
+        memset(command, 0, sizeof(command));
+        bytes_received = recv(client_socket, command, sizeof(command) - 1, 0);
+        if (bytes_received == -1) {
+            perror("recv");
+            close(client_socket);
+            close(server_socket);
+            return EXIT_FAILURE;
+        }
 
-    printf("[SERVER] Received command from client: \"%s\"\n", command);
-    printf("[SERVER] Executing command: \"%s\"\n", command);
+        if (bytes_received == 0) {
+            printf("[SERVER] Client disconnected. Closing session.\n");
+            break;
+        }
 
-    /*
-     * Reuse the shared Phase 1 execution path directly, but this time
-     * capture both stdout and stderr so they can be sent back over the
-     * socket and displayed on the client side.
-     */
-    shell_execute_line_capture(command, &captured_output, &output_size);
+        printf("[SERVER] Received command from client: \"%s\"\n", command);
+        printf("[SERVER] Executing command: \"%s\"\n", command);
 
-    /*
-     * Send a fixed-size length header first so the client knows how many
-     * bytes of command output to read next. This supports both long output
-     * and empty-output commands without relying on connection close timing.
-     */
-    network_output_size = htonl((uint32_t) output_size);
-    if (send_all(client_socket,
-                 &network_output_size,
-                 sizeof(network_output_size)) == -1) {
-        perror("send");
+        /*
+         * Capture both stdout and stderr for the current command using the
+         * same shared Phase 1 shell path already used by the local shell.
+         */
+        exit_requested = shell_execute_line_capture(command,
+                                                    &captured_output,
+                                                    &output_size);
+
+        /*
+         * Return the command output and session status together so the client
+         * knows whether to print another prompt or terminate cleanly.
+         */
+        if (send_response(client_socket,
+                          exit_requested ? SERVER_EXIT : SERVER_CONTINUE,
+                          captured_output,
+                          output_size) == -1) {
+            perror("send");
+            free(captured_output);
+            close(client_socket);
+            close(server_socket);
+            return EXIT_FAILURE;
+        }
+
+        printf("[SERVER] Sent %zu bytes of command output to client.\n", output_size);
+
         free(captured_output);
-        close(client_socket);
-        close(server_socket);
-        return EXIT_FAILURE;
+
+        if (exit_requested) {
+            printf("[SERVER] Exit command received. Closing session.\n");
+            break;
+        }
     }
 
-    if (output_size > 0 &&
-        send_all(client_socket, captured_output, output_size) == -1) {
-        perror("send");
-        free(captured_output);
-        close(client_socket);
-        close(server_socket);
-        return EXIT_FAILURE;
-    }
-
-    printf("[SERVER] Sent %zu bytes of command output to client.\n", output_size);
-
-    free(captured_output);
     close(client_socket);
     close(server_socket);
 
-    printf("[SERVER] Command transfer complete. Server shutting down.\n");
+    printf("[SERVER] Session complete. Server shutting down.\n");
     return EXIT_SUCCESS;
 }
