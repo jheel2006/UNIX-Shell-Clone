@@ -11,48 +11,60 @@
 /*
  * PORT
  * ----
- * TCP port used by both the client and the server for the
- * Phase 2 handshake milestone. This mirrors the Lab 7 style,
- * where both programs share one fixed port constant.
+ * TCP port shared with the server.
  */
 #define PORT 9002
 
 /*
  * BUFFER_SIZE
  * -----------
- * Fixed-size buffer used for the simple hello / hello back
- * message exchange in this branch.
+ * Maximum size of one command line and one placeholder server reply
+ * for this branch. The project already uses 1024-byte command input
+ * locally, so keeping the same scale here is consistent.
  */
 #define BUFFER_SIZE 1024
 
 /*
+ * trim_newline
+ * ------------
+ * Removes the trailing newline added by fgets() so the exact command
+ * text sent to the server matches what a shell parser would expect.
+ */
+static void trim_newline(char *text) {
+    if (text == NULL) {
+        return;
+    }
+
+    text[strcspn(text, "\n")] = '\0';
+}
+
+/*
  * main
  * ----
- * Phase 2 client handshake program.
+ * Phase 2 client for the command-send milestone.
  *
  * Responsibilities in this branch:
  *   1. Create a TCP socket
- *   2. Connect to the server socket
- *   3. Send one fixed "hello" message
- *   4. Receive one fixed reply from the server
- *   5. Print the received response
- *   6. Close the socket cleanly
+ *   2. Connect to the server
+ *   3. Show a shell-style "$ " prompt
+ *   4. Read one full command line from the user
+ *   5. Send that raw command string to the server
+ *   6. Receive a placeholder acknowledgement from the server
+ *   7. Print the acknowledgement and close
  *
- * This intentionally follows the same progression used by the
- * provided Lab 7 reference before we move to real shell commands.
+ * We intentionally handle only one command in this milestone.
+ * The repeated command loop comes in the next branch.
  */
 int main(void) {
     int network_socket;
     int connection_status;
     ssize_t bytes_received;
-    char hello_msg[] = "hello";
-    char hello_back_msg[BUFFER_SIZE];
+    char command[BUFFER_SIZE];
+    char server_reply[BUFFER_SIZE];
     struct sockaddr_in server_address;
 
     /*
-     * Create one IPv4 TCP socket.
-     * AF_INET     -> IPv4
-     * SOCK_STREAM -> TCP byte stream
+     * Create the client TCP socket.
      */
     network_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (network_socket == -1) {
@@ -61,9 +73,7 @@ int main(void) {
     }
 
     /*
-     * Describe the remote server we want to connect to.
-     * INADDR_ANY resolves to the local host in this simple
-     * single-machine test setup used in Lab 7 style exercises.
+     * Prepare the server address information used by connect().
      */
     memset(&server_address, 0, sizeof(server_address));
     server_address.sin_family = AF_INET;
@@ -71,9 +81,7 @@ int main(void) {
     server_address.sin_addr.s_addr = INADDR_ANY;
 
     /*
-     * Establish the client-to-server TCP connection.
-     * If the server is not running or not listening on this port,
-     * connect() fails and we report that error immediately.
+     * Connect the client socket to the listening server.
      */
     connection_status = connect(network_socket,
                                 (struct sockaddr *) &server_address,
@@ -84,29 +92,40 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    printf("[CLIENT] Connected to server on port %d.\n", PORT);
+    /*
+     * Read one command line in the same style as the local shell:
+     * display "$ " and wait for one full line of input.
+     */
+    printf("$ ");
+    fflush(stdout);
+
+    if (fgets(command, sizeof(command), stdin) == NULL) {
+        fprintf(stderr, "[CLIENT] Failed to read a command from standard input.\n");
+        close(network_socket);
+        return EXIT_FAILURE;
+    }
+
+    trim_newline(command);
 
     /*
-     * Send one fixed greeting message to the server.
-     * The terminating '\0' is included so the server can print
-     * the received text directly as a C string in this simple phase.
+     * Send the raw command string, including its terminating null byte.
+     * This keeps the server-side logging simple because it can print the
+     * received data directly as a C string for this milestone.
      */
-    if (send(network_socket, hello_msg, sizeof(hello_msg), 0) == -1) {
+    if (send(network_socket, command, strlen(command) + 1, 0) == -1) {
         perror("send");
         close(network_socket);
         return EXIT_FAILURE;
     }
 
-    printf("[CLIENT] Sent message: %s\n", hello_msg);
-
     /*
-     * Clear the receive buffer first so partial fills still leave
-     * a null-terminated string for safe printf("%s") usage.
+     * Receive a placeholder acknowledgement from the server.
+     * Later branches replace this with real command output.
      */
-    memset(hello_back_msg, 0, sizeof(hello_back_msg));
+    memset(server_reply, 0, sizeof(server_reply));
     bytes_received = recv(network_socket,
-                          hello_back_msg,
-                          sizeof(hello_back_msg) - 1,
+                          server_reply,
+                          sizeof(server_reply) - 1,
                           0);
     if (bytes_received == -1) {
         perror("recv");
@@ -120,13 +139,8 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    printf("[CLIENT] Received reply: %s\n", hello_back_msg);
+    printf("%s\n", server_reply);
 
-    /*
-     * Close the client socket after the single handshake is done.
-     * Later branches will keep the connection open for repeated
-     * command exchanges, but this branch stops after one round trip.
-     */
     close(network_socket);
     return EXIT_SUCCESS;
 }
