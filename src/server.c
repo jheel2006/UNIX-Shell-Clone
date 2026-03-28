@@ -112,6 +112,28 @@ static void print_payload_block(const char *payload, size_t payload_size) {
 }
 
 /*
+ * print_payload_inline
+ * --------------------
+ * Prints one payload inline after a log prefix while trimming a final
+ * newline if present. This is useful for single-line error messages,
+ * where the sample server output keeps the message on the same line.
+ */
+static void print_payload_inline(const char *payload, size_t payload_size) {
+    size_t printable_size = payload_size;
+
+    if (payload == NULL || payload_size == 0) {
+        return;
+    }
+
+    if (payload[printable_size - 1] == '\n') {
+        printable_size--;
+    }
+
+    fwrite(payload, 1, printable_size, stdout);
+    printf("\n");
+}
+
+/*
  * send_response
  * -------------
  * Sends one complete response packet for a command:
@@ -283,9 +305,10 @@ int main(void) {
          * knows whether to print another prompt or terminate cleanly.
          */
         if (is_error_output(captured_output)) {
-            printf("[ERROR] Command produced an error response.\n");
-            printf("[OUTPUT] Sending error message to client:\n");
-            print_payload_block(captured_output, output_size);
+            printf("[ERROR] ");
+            print_payload_inline(captured_output, output_size);
+            printf("[OUTPUT] Sending error message to client: ");
+            print_payload_inline(captured_output, output_size);
         } else if (output_size > 0) {
             printf("[OUTPUT] Sending output to client:\n");
             print_payload_block(captured_output, output_size);
