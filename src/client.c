@@ -19,11 +19,26 @@
 /*
  * BUFFER_SIZE
  * -----------
- * Maximum size of one command line and one placeholder server reply
- * for this branch. The project already uses 1024-byte command input
- * locally, so keeping the same scale here is consistent.
+ * Maximum size of one command line read from the terminal.
+ * This stays aligned with the shell's local input size.
  */
 #define BUFFER_SIZE 1024
+
+/*
+ * SERVER_CONTINUE
+ * ---------------
+ * Status flag sent by the server when the client should stay in the
+ * current session and prompt for another command.
+ */
+#define SERVER_CONTINUE 0U
+
+/*
+ * SERVER_EXIT
+ * -----------
+ * Status flag sent by the server when the remote shell session should
+ * terminate cleanly. This is used for the "exit" command.
+ */
+#define SERVER_EXIT 1U
 
 /*
  * send_all
@@ -75,6 +90,59 @@ static int recv_all(int socket_fd, void *buffer, size_t length) {
 }
 
 /*
+ * receive_response
+ * ----------------
+ * Reads one server response packet for the current session command.
+ * The packet consists of:
+ *   1. a 32-bit status flag
+ *   2. a 32-bit payload length
+ *   3. payload bytes (command output / error text)
+ *
+ * The caller owns *server_reply and must free it.
+ */
+static int receive_response(int socket_fd,
+                            uint32_t *server_status,
+                            char **server_reply,
+                            size_t *reply_size) {
+    uint32_t network_status;
+    uint32_t network_reply_size;
+
+    if (server_status == NULL || server_reply == NULL || reply_size == NULL) {
+        return -1;
+    }
+
+    *server_reply = NULL;
+    *reply_size = 0;
+
+    if (recv_all(socket_fd, &network_status, sizeof(network_status)) == -1) {
+        return -1;
+    }
+
+    if (recv_all(socket_fd,
+                 &network_reply_size,
+                 sizeof(network_reply_size)) == -1) {
+        return -1;
+    }
+
+    *server_status = ntohl(network_status);
+    *reply_size = (size_t) ntohl(network_reply_size);
+    *server_reply = malloc(*reply_size + 1);
+    if (*server_reply == NULL) {
+        return -1;
+    }
+
+    if (*reply_size > 0 &&
+        recv_all(socket_fd, *server_reply, *reply_size) == -1) {
+        free(*server_reply);
+        *server_reply = NULL;
+        return -1;
+    }
+
+    (*server_reply)[*reply_size] = '\0';
+    return 0;
+}
+
+/*
  * trim_newline
  * ------------
  * Removes the trailing newline added by fgets() so the exact command
@@ -91,27 +159,21 @@ static void trim_newline(char *text) {
 /*
  * main
  * ----
- * Phase 2 client for the command-send milestone.
+ * Phase 2 client for the persistent-session milestone.
  *
  * Responsibilities in this branch:
  *   1. Create a TCP socket
  *   2. Connect to the server
- *   3. Show a shell-style "$ " prompt
- *   4. Read one full command line from the user
- *   5. Send that raw command string to the server
- *   6. Receive the server's captured output/error payload
- *   7. Print that payload exactly and close
- *
- * We intentionally handle only one command in this milestone.
- * The repeated command loop comes in the next branch.
+ *   3. Repeatedly show a shell-style "$ " prompt
+ *   4. Read one command at a time and send it to the server
+ *   5. Receive one response packet per command
+ *   6. Print returned output/error text exactly
+ *   7. Stop only when the server signals session exit or input ends
  */
 int main(void) {
     int network_socket;
     int connection_status;
     char command[BUFFER_SIZE];
-    char *server_reply;
-    uint32_t network_reply_size;
-    size_t reply_size;
     struct sockaddr_in server_address;
 
     /*
@@ -143,76 +205,62 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    /*
-     * Read one command line in the same style as the local shell:
-     * display "$ " and wait for one full line of input.
-     */
-    printf("$ ");
-    fflush(stdout);
+    while (1) {
+        char *server_reply;
+        size_t reply_size;
+        uint32_t server_status;
 
-    if (fgets(command, sizeof(command), stdin) == NULL) {
-        fprintf(stderr, "[CLIENT] Failed to read a command from standard input.\n");
-        close(network_socket);
-        return EXIT_FAILURE;
-    }
+        /*
+         * Re-prompt after every completed round trip so the remote
+         * client behaves like an interactive shell session.
+         */
+        printf("$ ");
+        fflush(stdout);
 
-    trim_newline(command);
+        if (fgets(command, sizeof(command), stdin) == NULL) {
+            break;
+        }
 
-    /*
-     * Send the raw command string, including its terminating null byte.
-     * The server still logs the command as a plain C string, so sending
-     * the terminator keeps that side simple.
-     */
-    if (send_all(network_socket, command, strlen(command) + 1) == -1) {
-        perror("send");
-        close(network_socket);
-        return EXIT_FAILURE;
-    }
+        trim_newline(command);
 
-    /*
-     * Receive the exact byte length of the captured output first.
-     * This lets the client handle outputs longer than one recv() call
-     * and also supports empty-output commands cleanly.
-     */
-    if (recv_all(network_socket,
-                 &network_reply_size,
-                 sizeof(network_reply_size)) == -1) {
-        perror("recv");
-        close(network_socket);
-        return EXIT_FAILURE;
-    }
+        /*
+         * Send the raw command string, including the null terminator.
+         * The single persistent connection stays open for later commands.
+         */
+        if (send_all(network_socket, command, strlen(command) + 1) == -1) {
+            perror("send");
+            close(network_socket);
+            return EXIT_FAILURE;
+        }
 
-    reply_size = (size_t) ntohl(network_reply_size);
-    server_reply = malloc(reply_size + 1);
-    if (server_reply == NULL) {
-        fprintf(stderr, "[CLIENT] Failed to allocate memory for server output.\n");
-        close(network_socket);
-        return EXIT_FAILURE;
-    }
+        /*
+         * Receive one complete response packet for this command.
+         * The status flag tells the client whether to continue the
+         * session or exit after printing the returned payload.
+         */
+        if (receive_response(network_socket,
+                             &server_status,
+                             &server_reply,
+                             &reply_size) == -1) {
+            fprintf(stderr, "[CLIENT] Failed to receive a complete server response.\n");
+            close(network_socket);
+            return EXIT_FAILURE;
+        }
 
-    if (reply_size > 0 &&
-        recv_all(network_socket, server_reply, reply_size) == -1) {
-        perror("recv");
+        if (reply_size > 0) {
+            fwrite(server_reply, 1, reply_size, stdout);
+            if (server_reply[reply_size - 1] != '\n') {
+                printf("\n");
+            }
+        }
+
         free(server_reply);
-        close(network_socket);
-        return EXIT_FAILURE;
-    }
 
-    server_reply[reply_size] = '\0';
-
-    /*
-     * Print the returned command output exactly as received.
-     * We avoid adding our own formatting so shell output and error
-     * text remain unchanged from the server-side execution path.
-     */
-    if (reply_size > 0) {
-        fwrite(server_reply, 1, reply_size, stdout);
-        if (server_reply[reply_size - 1] != '\n') {
-            printf("\n");
+        if (server_status == SERVER_EXIT) {
+            break;
         }
     }
 
-    free(server_reply);
     close(network_socket);
     return EXIT_SUCCESS;
 }
