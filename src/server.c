@@ -71,6 +71,47 @@ static int send_all(int socket_fd, const void *buffer, size_t length) {
 }
 
 /*
+ * is_error_output
+ * ---------------
+ * Best-effort classifier for the text returned by the shared shell path.
+ * The server only receives one combined stdout/stderr payload, so this
+ * helper uses known assignment error strings and common perror prefixes
+ * to decide whether the payload should be described as normal output or
+ * an error message in the server log.
+ */
+static int is_error_output(const char *payload) {
+    if (payload == NULL || *payload == '\0') {
+        return 0;
+    }
+
+    return strncmp(payload, "Input file not specified.", 25) == 0 ||
+           strncmp(payload, "Output file not specified.", 26) == 0 ||
+           strncmp(payload, "Error output file not specified.", 32) == 0 ||
+           strncmp(payload, "Command missing after pipe.", 27) == 0 ||
+           strncmp(payload, "Empty command between pipes.", 28) == 0 ||
+           strncmp(payload, "Command not found.", 18) == 0 ||
+           strncmp(payload, "Command not found in pipe sequence.", 35) == 0 ||
+           strncmp(payload, "open:", 5) == 0;
+}
+
+/*
+ * print_payload_block
+ * -------------------
+ * Prints the command payload on the server terminal in a readable way
+ * without changing the exact bytes that will be sent back to the client.
+ */
+static void print_payload_block(const char *payload, size_t payload_size) {
+    if (payload == NULL || payload_size == 0) {
+        return;
+    }
+
+    fwrite(payload, 1, payload_size, stdout);
+    if (payload[payload_size - 1] != '\n') {
+        printf("\n");
+    }
+}
+
+/*
  * send_response
  * -------------
  * Sends one complete response packet for a command:
@@ -110,7 +151,7 @@ static int send_response(int client_socket,
 /*
  * main
  * ----
- * Phase 2 server for the persistent-session milestone.
+ * Phase 2 server for the polished persistent-session milestone.
  *
  * Responsibilities in this branch:
  *   1. Create, bind, and listen on a TCP socket
@@ -165,8 +206,6 @@ int main(void) {
     server_address.sin_port = htons(PORT);
     server_address.sin_addr.s_addr = INADDR_ANY;
 
-    printf("[SERVER] Socket created successfully.\n");
-
     /*
      * Bind the server socket to the chosen local port.
      */
@@ -178,8 +217,6 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    printf("[SERVER] Bind successful on port %d.\n", PORT);
-
     /*
      * Start listening for one or more incoming connection attempts.
      */
@@ -189,7 +226,7 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    printf("[SERVER] Listening for client connections...\n");
+    printf("[INFO] Server started, waiting for client connections...\n");
 
     /*
      * Wait for exactly one client for this milestone.
@@ -204,7 +241,7 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    printf("[SERVER] Client connected successfully.\n");
+    printf("[INFO] Client connected.\n");
 
     while (1) {
         char *captured_output;
@@ -226,12 +263,12 @@ int main(void) {
         }
 
         if (bytes_received == 0) {
-            printf("[SERVER] Client disconnected. Closing session.\n");
+            printf("[INFO] Client disconnected. Closing session.\n");
             break;
         }
 
-        printf("[SERVER] Received command from client: \"%s\"\n", command);
-        printf("[SERVER] Executing command: \"%s\"\n", command);
+        printf("[RECEIVED] Received command: \"%s\" from client.\n", command);
+        printf("[EXECUTING] Executing command: \"%s\"\n", command);
 
         /*
          * Capture both stdout and stderr for the current command using the
@@ -245,6 +282,17 @@ int main(void) {
          * Return the command output and session status together so the client
          * knows whether to print another prompt or terminate cleanly.
          */
+        if (is_error_output(captured_output)) {
+            printf("[ERROR] Command produced an error response.\n");
+            printf("[OUTPUT] Sending error message to client:\n");
+            print_payload_block(captured_output, output_size);
+        } else if (output_size > 0) {
+            printf("[OUTPUT] Sending output to client:\n");
+            print_payload_block(captured_output, output_size);
+        } else {
+            printf("[OUTPUT] Command produced no visible output.\n");
+        }
+
         if (send_response(client_socket,
                           exit_requested ? SERVER_EXIT : SERVER_CONTINUE,
                           captured_output,
@@ -256,12 +304,12 @@ int main(void) {
             return EXIT_FAILURE;
         }
 
-        printf("[SERVER] Sent %zu bytes of command output to client.\n", output_size);
+        printf("[INFO] Sent %zu bytes to client.\n", output_size);
 
         free(captured_output);
 
         if (exit_requested) {
-            printf("[SERVER] Exit command received. Closing session.\n");
+            printf("[INFO] Exit command received. Closing session.\n");
             break;
         }
     }
@@ -269,6 +317,6 @@ int main(void) {
     close(client_socket);
     close(server_socket);
 
-    printf("[SERVER] Session complete. Server shutting down.\n");
+    printf("[INFO] Session complete. Server shutting down.\n");
     return EXIT_SUCCESS;
 }

@@ -16,6 +16,8 @@ SERVER_OBJ = $(SERVER_SRC:.c=.o)
 
 TARGETS = myshell client server
 
+.PHONY: all clean
+
 all: $(TARGETS)
 
 myshell: $(CORE_OBJ) $(SHELL_OBJ)

@@ -6,6 +6,11 @@ myshell
 client
 server
 
+# Local test artifacts
+input.txt
+output.txt
+error.log
+
 # Mac system files
 .DS_Store
 
