@@ -24,8 +24,8 @@ myshell: $(CORE_OBJ) $(SHELL_OBJ)
 client: $(CLIENT_OBJ)
 	$(CC) $(CFLAGS) $(CLIENT_OBJ) -o client
 
-server: $(SERVER_OBJ)
-	$(CC) $(CFLAGS) $(SERVER_OBJ) -o server
+server: $(CORE_OBJ) $(SERVER_OBJ)
+	$(CC) $(CFLAGS) $(CORE_OBJ) $(SERVER_OBJ) -o server
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDE) -c $< -o $@

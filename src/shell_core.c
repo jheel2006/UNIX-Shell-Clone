@@ -39,7 +39,11 @@ static void free_pipeline(Pipeline *pipeline) {
  * shell_execute_line
  * ------------------
  * Reuses the Phase 1 parser and executors for a single command line.
- * Returns 0 after handling the line and 1 only when the caller should exit.
+ * This function is intentionally front-end agnostic so both the local
+ * shell and the remote server can drive the exact same execution path.
+ *
+ * Returns 0 after handling the line and 1 only when the caller should
+ * interpret the input as an "exit" request.
  */
 int shell_execute_line(char *line) {
     Pipeline *pipeline;

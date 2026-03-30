@@ -8,6 +8,8 @@
 
 #include <netinet/in.h>
 
+#include "shell_core.h"
+
 /*
  * PORT
  * ----
@@ -25,7 +27,7 @@
 /*
  * BUFFER_SIZE
  * -----------
- * Maximum size of one received command and one placeholder reply.
+ * Maximum size of one received command and one acknowledgement reply.
  */
 #define BUFFER_SIZE 1024
 
@@ -38,12 +40,12 @@
  *   1. Create, bind, and listen on a TCP socket
  *   2. Accept one client connection
  *   3. Receive one raw shell command string
- *   4. Log the exact command text on the server side
- *   5. Send back a placeholder acknowledgement
+ *   4. Pass that command into the shared Phase 1 shell engine
+ *   5. Send back an acknowledgement after execution completes
  *   6. Close sockets cleanly
  *
- * The server still does not execute the command here. This branch is
- * only about proving that command strings travel correctly over the socket.
+ * This branch intentionally reuses shell_execute_line() from shell_core
+ * so the server does not duplicate parser/executor logic locally.
  */
 int main(void) {
     int opt = 1;
@@ -153,12 +155,24 @@ int main(void) {
     printf("[SERVER] Executing command: \"%s\"\n", command);
 
     /*
-     * This milestone stops at verified transport, so the server sends
-     * back a placeholder acknowledgement instead of real command output.
+     * Reuse the shared Phase 1 execution path directly.
+     * This means the same parser, single-command execution logic,
+     * and pipeline execution logic already used by myshell also
+     * drive remote command handling on the server side.
+     *
+     * In this branch, stdout/stderr still go to the server terminal.
+     * Returning actual command output to the client is deferred to
+     * the next milestone, where execution output will be captured.
+     */
+    shell_execute_line(command);
+
+    /*
+     * Keep the client-side flow alive by returning a short
+     * acknowledgement message after the shared shell engine runs.
      */
     snprintf(response,
              sizeof(response),
-             "[CLIENT] Server received command: \"%s\"",
+             "[CLIENT] Server executed command: \"%s\"",
              command);
 
     if (send(client_socket, response, strlen(response) + 1, 0) == -1) {
@@ -168,7 +182,7 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    printf("[SERVER] Sent placeholder response to client.\n");
+    printf("[SERVER] Sent execution acknowledgement to client.\n");
 
     close(client_socket);
     close(server_socket);
