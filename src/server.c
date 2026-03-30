@@ -11,56 +11,52 @@
 /*
  * PORT
  * ----
- * Shared TCP port used by the client and server during the
- * initial handshake milestone.
+ * Shared TCP port used by the client and server.
  */
 #define PORT 9002
 
 /*
  * BACKLOG
  * -------
- * Number of queued pending connections that listen() may hold.
- * One client is enough for this milestone, but keeping a small
- * backlog mirrors common socket setup practice.
+ * Number of queued pending client connection requests.
  */
 #define BACKLOG 5
 
 /*
  * BUFFER_SIZE
  * -----------
- * Receive buffer for the fixed handshake message.
+ * Maximum size of one received command and one placeholder reply.
  */
 #define BUFFER_SIZE 1024
 
 /*
  * main
  * ----
- * Phase 2 server handshake program.
+ * Phase 2 server for the command-send milestone.
  *
  * Responsibilities in this branch:
- *   1. Create a TCP socket
- *   2. Bind it to the fixed port
- *   3. Listen for one incoming client
- *   4. Accept the connection
- *   5. Receive one fixed greeting message
- *   6. Reply with one fixed response
- *   7. Close sockets cleanly
+ *   1. Create, bind, and listen on a TCP socket
+ *   2. Accept one client connection
+ *   3. Receive one raw shell command string
+ *   4. Log the exact command text on the server side
+ *   5. Send back a placeholder acknowledgement
+ *   6. Close sockets cleanly
  *
- * The detailed print statements are intentional because the
- * project rubric wants visible server-side flow information.
+ * The server still does not execute the command here. This branch is
+ * only about proving that command strings travel correctly over the socket.
  */
 int main(void) {
+    int opt = 1;
     int server_socket;
     int client_socket;
     int addrlen;
     ssize_t bytes_received;
-    char hello_msg[BUFFER_SIZE];
-    char hello_back_msg[] = "hello back";
+    char command[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
     struct sockaddr_in server_address;
 
     /*
-     * Create the listening socket.
-     * This is the endpoint that will later wait for a remote client.
+     * Create the listening TCP socket.
      */
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == -1) {
@@ -69,8 +65,22 @@ int main(void) {
     }
 
     /*
-     * Populate the local address structure for bind().
-     * The server listens on all local interfaces using INADDR_ANY.
+     * Allow quick server restarts while developing and testing.
+     * Without this, the port may remain temporarily unavailable
+     * after a recent close because of TCP TIME_WAIT behavior.
+     */
+    if (setsockopt(server_socket,
+                   SOL_SOCKET,
+                   SO_REUSEADDR,
+                   &opt,
+                   sizeof(opt)) < 0) {
+        perror("setsockopt");
+        close(server_socket);
+        return EXIT_FAILURE;
+    }
+
+    /*
+     * Fill in the local address used by bind().
      */
     memset(&server_address, 0, sizeof(server_address));
     server_address.sin_family = AF_INET;
@@ -80,8 +90,7 @@ int main(void) {
     printf("[SERVER] Socket created successfully.\n");
 
     /*
-     * Bind the socket to the selected port so clients know
-     * where to connect.
+     * Bind the server socket to the chosen local port.
      */
     if (bind(server_socket,
              (struct sockaddr *) &server_address,
@@ -94,8 +103,7 @@ int main(void) {
     printf("[SERVER] Bind successful on port %d.\n", PORT);
 
     /*
-     * Mark the socket as a listening socket so the kernel
-     * can queue incoming client connection requests.
+     * Start listening for one or more incoming connection attempts.
      */
     if (listen(server_socket, BACKLOG) < 0) {
         perror("listen");
@@ -106,8 +114,7 @@ int main(void) {
     printf("[SERVER] Listening for client connections...\n");
 
     /*
-     * accept() blocks until one client connects.
-     * For this branch, handling a single client is enough.
+     * Wait for exactly one client for this milestone.
      */
     addrlen = sizeof(server_address);
     client_socket = accept(server_socket,
@@ -122,11 +129,12 @@ int main(void) {
     printf("[SERVER] Client connected successfully.\n");
 
     /*
-     * Receive the client's greeting.
-     * We clear the buffer first so printing it as a string remains safe.
+     * Receive one raw command string from the client.
+     * The client sends the trailing '\0', so the server can
+     * print the command exactly as a normal C string.
      */
-    memset(hello_msg, 0, sizeof(hello_msg));
-    bytes_received = recv(client_socket, hello_msg, sizeof(hello_msg) - 1, 0);
+    memset(command, 0, sizeof(command));
+    bytes_received = recv(client_socket, command, sizeof(command) - 1, 0);
     if (bytes_received == -1) {
         perror("recv");
         close(client_socket);
@@ -135,35 +143,36 @@ int main(void) {
     }
 
     if (bytes_received == 0) {
-        fprintf(stderr, "[SERVER] Client disconnected before sending data.\n");
+        fprintf(stderr, "[SERVER] Client disconnected before sending a command.\n");
         close(client_socket);
         close(server_socket);
         return EXIT_FAILURE;
     }
 
-    printf("[SERVER] Received message from client: %s\n", hello_msg);
+    printf("[SERVER] Received command from client: \"%s\"\n", command);
+    printf("[SERVER] Executing command: \"%s\"\n", command);
 
     /*
-     * Reply with the fixed acknowledgement message required
-     * for this handshake-only milestone.
+     * This milestone stops at verified transport, so the server sends
+     * back a placeholder acknowledgement instead of real command output.
      */
-    if (send(client_socket, hello_back_msg, sizeof(hello_back_msg), 0) == -1) {
+    snprintf(response,
+             sizeof(response),
+             "[CLIENT] Server received command: \"%s\"",
+             command);
+
+    if (send(client_socket, response, strlen(response) + 1, 0) == -1) {
         perror("send");
         close(client_socket);
         close(server_socket);
         return EXIT_FAILURE;
     }
 
-    printf("[SERVER] Sent reply to client: %s\n", hello_back_msg);
+    printf("[SERVER] Sent placeholder response to client.\n");
 
-    /*
-     * Close both the connected socket and the listening socket.
-     * Later branches may keep the connection open longer, but this
-     * milestone ends after one successful request/response pair.
-     */
     close(client_socket);
     close(server_socket);
 
-    printf("[SERVER] Handshake complete. Server shutting down.\n");
+    printf("[SERVER] Command transfer complete. Server shutting down.\n");
     return EXIT_SUCCESS;
 }
