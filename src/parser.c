@@ -171,7 +171,7 @@ static char *next_token(char **input) {
     buffer[i] = '\0';
 
     if (state != OUTSIDE) {
-        fprintf(stderr, "Unmatched quote");
+        fprintf(stderr, "Unmatched quote\n");
         return NULL;
     }
 
