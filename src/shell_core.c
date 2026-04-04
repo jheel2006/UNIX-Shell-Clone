@@ -23,13 +23,23 @@
  */
 static void free_pipeline(Pipeline *pipeline) {
     int i;
+    int j;
 
     if (pipeline == NULL) {
         return;
     }
 
     for (i = 0; i < pipeline->num_commands; i++) {
-        free(pipeline->commands[i].argv);
+        if (pipeline->commands[i].argv != NULL) {
+            for (j = 0; pipeline->commands[i].argv[j] != NULL; j++) {
+                free(pipeline->commands[i].argv[j]);
+            }
+            free(pipeline->commands[i].argv);
+        }
+
+        free(pipeline->commands[i].input_file);
+        free(pipeline->commands[i].output_file);
+        free(pipeline->commands[i].error_file);
     }
 
     free(pipeline->commands);
