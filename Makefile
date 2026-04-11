@@ -1,5 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g
+THREAD_FLAGS = -pthread
 INCLUDE = -Iinclude
 
 CORE_SRC = src/exec.c src/pipes.c src/parser.c src/shell_core.c
@@ -27,7 +28,7 @@ client: $(CLIENT_OBJ)
 	$(CC) $(CFLAGS) $(CLIENT_OBJ) -o client
 
 server: $(CORE_OBJ) $(SERVER_OBJ)
-	$(CC) $(CFLAGS) $(CORE_OBJ) $(SERVER_OBJ) -o server
+	$(CC) $(CFLAGS) $(THREAD_FLAGS) $(CORE_OBJ) $(SERVER_OBJ) -o server
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(INCLUDE) -c $< -o $@

@@ -1,5 +1,8 @@
-#include <stdio.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -21,9 +24,9 @@
 /*
  * BACKLOG
  * -------
- * Number of queued pending client connection requests.
+ * Number of pending client connections the listening socket may queue.
  */
-#define BACKLOG 5
+#define BACKLOG 10
 
 /*
  * BUFFER_SIZE
@@ -47,6 +50,27 @@
  * end to the remote shell session.
  */
 #define SERVER_EXIT 1U
+
+/*
+ * ClientContext
+ * -------------
+ * Thread-owned session state for one connected client.
+ */
+typedef struct {
+    int socket_fd;
+    int client_number;
+    int thread_number;
+    struct sockaddr_in address;
+} ClientContext;
+
+/*
+ * Global state used only for synchronized server-side logging and for
+ * assigning deterministic client/thread numbers to new connections.
+ */
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int next_client_number = 1;
+static int next_thread_number = 1;
 
 /*
  * send_all
@@ -91,7 +115,10 @@ static int is_error_output(const char *payload) {
            strncmp(payload, "Empty command between pipes.", 28) == 0 ||
            strncmp(payload, "Command not found.", 18) == 0 ||
            strncmp(payload, "Command not found in pipe sequence.", 35) == 0 ||
-           strncmp(payload, "open:", 5) == 0;
+           strncmp(payload, "open:", 5) == 0 ||
+           strncmp(payload, "Unmatched quote", 15) == 0 ||
+           strncmp(payload, "fork:", 5) == 0 ||
+           strncmp(payload, "pipe:", 5) == 0;
 }
 
 /*
@@ -134,6 +161,67 @@ static void print_payload_inline(const char *payload, size_t payload_size) {
 }
 
 /*
+ * log_client_prefix
+ * -----------------
+ * Writes the shared client identity block used in the required output.
+ */
+static void log_client_prefix(const ClientContext *client) {
+    char ip_address[INET_ADDRSTRLEN];
+
+    inet_ntop(AF_INET,
+              &client->address.sin_addr,
+              ip_address,
+              sizeof(ip_address));
+
+    printf("[Client #%d - %s:%d]",
+           client->client_number,
+           ip_address,
+           ntohs(client->address.sin_port));
+}
+
+/*
+ * log_connection_open
+ * -------------------
+ * Prints the connection assignment message for a newly accepted client.
+ */
+static void log_connection_open(const ClientContext *client) {
+    char ip_address[INET_ADDRSTRLEN];
+
+    inet_ntop(AF_INET,
+              &client->address.sin_addr,
+              ip_address,
+              sizeof(ip_address));
+
+    pthread_mutex_lock(&log_mutex);
+    printf("[INFO] Client #%d connected from %s:%d. Assigned to Thread-%d.\n",
+           client->client_number,
+           ip_address,
+           ntohs(client->address.sin_port),
+           client->thread_number);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+/*
+ * log_disconnect
+ * --------------
+ * Prints a client disconnect event in the same synchronized log stream.
+ */
+static void log_disconnect(const ClientContext *client, const char *reason) {
+    pthread_mutex_lock(&log_mutex);
+
+    if (reason != NULL) {
+        printf("[INFO] ");
+        log_client_prefix(client);
+        printf(" %s\n", reason);
+    }
+
+    printf("[INFO] Client #%d disconnected.\n", client->client_number);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+/*
  * send_response
  * -------------
  * Sends one complete response packet for a command:
@@ -171,45 +259,125 @@ static int send_response(int client_socket,
 }
 
 /*
+ * handle_client
+ * -------------
+ * Detached worker thread that owns one client connection for the full
+ * duration of that remote session.
+ */
+static void *handle_client(void *arg) {
+    ClientContext *client = arg;
+
+    while (1) {
+        ssize_t bytes_received;
+        char command[BUFFER_SIZE];
+        char *captured_output = NULL;
+        size_t output_size = 0;
+        int exit_requested;
+
+        memset(command, 0, sizeof(command));
+        bytes_received = recv(client->socket_fd, command, sizeof(command) - 1, 0);
+        if (bytes_received < 0) {
+            pthread_mutex_lock(&log_mutex);
+            printf("[ERROR] ");
+            log_client_prefix(client);
+            printf(" recv failed: %s\n", strerror(errno));
+            fflush(stdout);
+            pthread_mutex_unlock(&log_mutex);
+            break;
+        }
+
+        if (bytes_received == 0) {
+            log_disconnect(client, "Client closed the connection.");
+            break;
+        }
+
+        pthread_mutex_lock(&log_mutex);
+        printf("[RECEIVED] ");
+        log_client_prefix(client);
+        printf(" Received command: \"%s\"\n", command);
+        printf("[EXECUTING] ");
+        log_client_prefix(client);
+        printf(" Executing command: \"%s\"\n", command);
+        fflush(stdout);
+        pthread_mutex_unlock(&log_mutex);
+
+        exit_requested = shell_execute_line_capture(command,
+                                                    &captured_output,
+                                                    &output_size);
+
+        pthread_mutex_lock(&log_mutex);
+        if (is_error_output(captured_output)) {
+            printf("[ERROR] ");
+            log_client_prefix(client);
+            printf(" ");
+            print_payload_inline(captured_output, output_size);
+            printf("[OUTPUT] ");
+            log_client_prefix(client);
+            printf(" Sending error message to client:\n");
+            print_payload_block(captured_output, output_size);
+        } else if (output_size > 0) {
+            printf("[OUTPUT] ");
+            log_client_prefix(client);
+            printf(" Sending output to client:\n");
+            print_payload_block(captured_output, output_size);
+        } else {
+            printf("[OUTPUT] ");
+            log_client_prefix(client);
+            printf(" Command produced no visible output.\n");
+        }
+        fflush(stdout);
+        pthread_mutex_unlock(&log_mutex);
+
+        if (send_response(client->socket_fd,
+                          exit_requested ? SERVER_EXIT : SERVER_CONTINUE,
+                          captured_output,
+                          output_size) == -1) {
+            pthread_mutex_lock(&log_mutex);
+            printf("[ERROR] ");
+            log_client_prefix(client);
+            printf(" send failed: %s\n", strerror(errno));
+            fflush(stdout);
+            pthread_mutex_unlock(&log_mutex);
+            free(captured_output);
+            break;
+        }
+
+        free(captured_output);
+
+        if (exit_requested) {
+            log_disconnect(client, "Client requested disconnect. Closing connection.");
+            break;
+        }
+    }
+
+    close(client->socket_fd);
+    free(client);
+    return NULL;
+}
+
+/*
  * main
  * ----
- * Phase 2 server for the polished persistent-session milestone.
+ * Phase 3 server entry point.
  *
  * Responsibilities in this branch:
  *   1. Create, bind, and listen on a TCP socket
- *   2. Accept one client connection
- *   3. Repeatedly receive commands over the same connection
- *   4. Pass each command into the shared Phase 1 shell engine
- *   5. Send the resulting output/error text back to the client
- *   6. Stop only on disconnect or clean "exit"
- *   7. Close sockets cleanly
- *
- * This branch intentionally reuses shell_execute_line() from shell_core
- * so the server does not duplicate parser/executor logic locally.
+ *   2. Accept clients continuously
+ *   3. Spawn one detached thread per client session
+ *   4. Reuse the shared shell execution path for each command
+ *   5. Log every incoming and outgoing event with client identity
  */
 int main(void) {
     int opt = 1;
     int server_socket;
-    int client_socket;
-    int addrlen;
-    ssize_t bytes_received;
-    char command[BUFFER_SIZE];
     struct sockaddr_in server_address;
 
-    /*
-     * Create the listening TCP socket.
-     */
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == -1) {
         perror("socket");
         return EXIT_FAILURE;
     }
 
-    /*
-     * Allow quick server restarts while developing and testing.
-     * Without this, the port may remain temporarily unavailable
-     * after a recent close because of TCP TIME_WAIT behavior.
-     */
     if (setsockopt(server_socket,
                    SOL_SOCKET,
                    SO_REUSEADDR,
@@ -220,17 +388,11 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    /*
-     * Fill in the local address used by bind().
-     */
     memset(&server_address, 0, sizeof(server_address));
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(PORT);
     server_address.sin_addr.s_addr = INADDR_ANY;
 
-    /*
-     * Bind the server socket to the chosen local port.
-     */
     if (bind(server_socket,
              (struct sockaddr *) &server_address,
              sizeof(server_address)) < 0) {
@@ -239,9 +401,6 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    /*
-     * Start listening for one or more incoming connection attempts.
-     */
     if (listen(server_socket, BACKLOG) < 0) {
         perror("listen");
         close(server_socket);
@@ -249,95 +408,54 @@ int main(void) {
     }
 
     printf("[INFO] Server started, waiting for client connections...\n");
-
-    /*
-     * Wait for exactly one client for this milestone.
-     */
-    addrlen = sizeof(server_address);
-    client_socket = accept(server_socket,
-                           (struct sockaddr *) &server_address,
-                           (socklen_t *) &addrlen);
-    if (client_socket < 0) {
-        perror("accept");
-        close(server_socket);
-        return EXIT_FAILURE;
-    }
-
-    printf("[INFO] Client connected.\n");
+    fflush(stdout);
 
     while (1) {
-        char *captured_output;
-        size_t output_size;
-        int exit_requested;
+        int client_socket;
+        socklen_t client_length;
+        pthread_t thread_id;
+        ClientContext *client;
 
-        /*
-         * Receive the next raw command string from the same connected client.
-         * Each command is still sent as a null-terminated string so the server
-         * can log it directly without extra parsing at the transport layer.
-         */
-        memset(command, 0, sizeof(command));
-        bytes_received = recv(client_socket, command, sizeof(command) - 1, 0);
-        if (bytes_received == -1) {
-            perror("recv");
-            close(client_socket);
+        client = malloc(sizeof(*client));
+        if (client == NULL) {
+            perror("malloc");
             close(server_socket);
             return EXIT_FAILURE;
         }
 
-        if (bytes_received == 0) {
-            printf("[INFO] Client disconnected. Closing session.\n");
-            break;
+        client_length = sizeof(client->address);
+        client_socket = accept(server_socket,
+                               (struct sockaddr *) &client->address,
+                               &client_length);
+        if (client_socket < 0) {
+            free(client);
+            perror("accept");
+            continue;
         }
 
-        printf("[RECEIVED] Received command: \"%s\" from client.\n", command);
-        printf("[EXECUTING] Executing command: \"%s\"\n", command);
+        pthread_mutex_lock(&counter_mutex);
+        client->socket_fd = client_socket;
+        client->client_number = next_client_number++;
+        client->thread_number = next_thread_number++;
+        pthread_mutex_unlock(&counter_mutex);
 
-        /*
-         * Capture both stdout and stderr for the current command using the
-         * same shared Phase 1 shell path already used by the local shell.
-         */
-        exit_requested = shell_execute_line_capture(command,
-                                                    &captured_output,
-                                                    &output_size);
+        log_connection_open(client);
 
-        /*
-         * Return the command output and session status together so the client
-         * knows whether to print another prompt or terminate cleanly.
-         */
-        if (is_error_output(captured_output)) {
-            printf("[ERROR] ");
-            print_payload_inline(captured_output, output_size);
-            printf("[OUTPUT] Sending error message to client: ");
-            print_payload_inline(captured_output, output_size);
-        } else if (output_size > 0) {
-            printf("[OUTPUT] Sending output to client:\n");
-            print_payload_block(captured_output, output_size);
-        } else {
-            printf("[OUTPUT] Command produced no visible output.\n");
-        }
-
-        if (send_response(client_socket,
-                          exit_requested ? SERVER_EXIT : SERVER_CONTINUE,
-                          captured_output,
-                          output_size) == -1) {
-            perror("send");
-            free(captured_output);
+        if (pthread_create(&thread_id, NULL, handle_client, client) != 0) {
+            perror("pthread_create");
             close(client_socket);
-            close(server_socket);
-            return EXIT_FAILURE;
+            free(client);
+            continue;
         }
 
-        free(captured_output);
-
-        if (exit_requested) {
-            printf("[INFO] Exit command received. Closing session.\n");
-            break;
+        if (pthread_detach(thread_id) != 0) {
+            perror("pthread_detach");
+            close(client_socket);
+            free(client);
+            continue;
         }
     }
 
-    close(client_socket);
     close(server_socket);
-
-    printf("[INFO] Session complete. Server shutting down.\n");
     return EXIT_SUCCESS;
 }

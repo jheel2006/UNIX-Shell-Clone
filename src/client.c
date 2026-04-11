@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#include <arpa/inet.h>
 #include <netinet/in.h>
 
 /*
@@ -191,7 +192,11 @@ int main(void) {
     memset(&server_address, 0, sizeof(server_address));
     server_address.sin_family = AF_INET;
     server_address.sin_port = htons(PORT);
-    server_address.sin_addr.s_addr = INADDR_ANY;
+    if (inet_pton(AF_INET, "127.0.0.1", &server_address.sin_addr) != 1) {
+        fprintf(stderr, "[CLIENT] Failed to parse server address.\n");
+        close(network_socket);
+        return EXIT_FAILURE;
+    }
 
     /*
      * Connect the client socket to the listening server.
@@ -257,6 +262,7 @@ int main(void) {
         free(server_reply);
 
         if (server_status == SERVER_EXIT) {
+            printf("Disconnected from server.\n");
             break;
         }
     }
