@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "exec.h"
@@ -123,13 +124,14 @@ int shell_execute_line(char *line) {
 int shell_execute_line_capture(char *line,
                                char **captured_output,
                                size_t *captured_size) {
-    FILE *capture_file;
-    int saved_stdout;
-    int saved_stderr;
-    int capture_fd;
-    int exit_requested;
-    long file_size;
-    char *buffer;
+    int pipe_fd[2];
+    pid_t child_pid;
+    int child_status;
+    size_t total_size = 0;
+    size_t capacity = 0;
+    ssize_t bytes_read;
+    char chunk[4096];
+    char *buffer = NULL;
 
     if (captured_output == NULL || captured_size == NULL) {
         return 1;
@@ -138,121 +140,111 @@ int shell_execute_line_capture(char *line,
     *captured_output = NULL;
     *captured_size = 0;
 
-    saved_stdout = dup(STDOUT_FILENO);
-    saved_stderr = dup(STDERR_FILENO);
-    if (saved_stdout < 0 || saved_stderr < 0) {
-        if (saved_stdout >= 0) close(saved_stdout);
-        if (saved_stderr >= 0) close(saved_stderr);
-        *captured_output = duplicate_text("Failed to duplicate output streams.\n");
+    if (pipe(pipe_fd) < 0) {
+        *captured_output = duplicate_text("Failed to create capture pipe.\n");
         if (*captured_output != NULL) {
             *captured_size = strlen(*captured_output);
         }
         return 0;
     }
 
-    capture_file = tmpfile();
-    if (capture_file == NULL) {
-        close(saved_stdout);
-        close(saved_stderr);
-        *captured_output = duplicate_text("Failed to create temporary capture file.\n");
+    child_pid = fork();
+    if (child_pid < 0) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        *captured_output = duplicate_text("Failed to fork capture process.\n");
         if (*captured_output != NULL) {
             *captured_size = strlen(*captured_output);
         }
         return 0;
     }
 
-    capture_fd = fileno(capture_file);
+    if (child_pid == 0) {
+        int exit_requested;
 
-    /*
-     * Flush any pending text first so only the target command's output
-     * is redirected into the temporary capture file.
-     */
-    fflush(stdout);
-    fflush(stderr);
+        close(pipe_fd[0]);
 
-    if (dup2(capture_fd, STDOUT_FILENO) < 0 ||
-        dup2(capture_fd, STDERR_FILENO) < 0) {
-        dup2(saved_stdout, STDOUT_FILENO);
-        dup2(saved_stderr, STDERR_FILENO);
-        close(saved_stdout);
-        close(saved_stderr);
-        fclose(capture_file);
-        *captured_output = duplicate_text("Failed to redirect output streams.\n");
-        if (*captured_output != NULL) {
-            *captured_size = strlen(*captured_output);
+        if (dup2(pipe_fd[1], STDOUT_FILENO) < 0 ||
+            dup2(pipe_fd[1], STDERR_FILENO) < 0) {
+            _exit(EXIT_FAILURE);
         }
-        return 0;
+
+        close(pipe_fd[1]);
+
+        exit_requested = shell_execute_line(line);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(exit_requested ? 1 : 0);
     }
 
-    exit_requested = shell_execute_line(line);
+    close(pipe_fd[1]);
 
-    /*
-     * Flush the redirected streams before restoring the original terminal
-     * file descriptors so every byte written by the command is persisted.
-     */
-    fflush(stdout);
-    fflush(stderr);
+    while ((bytes_read = read(pipe_fd[0], chunk, sizeof(chunk))) > 0) {
+        char *resized_buffer;
 
-    dup2(saved_stdout, STDOUT_FILENO);
-    dup2(saved_stderr, STDERR_FILENO);
-    close(saved_stdout);
-    close(saved_stderr);
+        if (total_size + (size_t) bytes_read + 1 > capacity) {
+            size_t new_capacity = capacity == 0 ? 4096 : capacity;
 
-    if (fseek(capture_file, 0L, SEEK_END) != 0) {
-        fclose(capture_file);
-        *captured_output = duplicate_text("Failed to size captured output.\n");
-        if (*captured_output != NULL) {
-            *captured_size = strlen(*captured_output);
+            while (new_capacity < total_size + (size_t) bytes_read + 1) {
+                new_capacity *= 2;
+            }
+
+            resized_buffer = realloc(buffer, new_capacity);
+            if (resized_buffer == NULL) {
+                free(buffer);
+                buffer = duplicate_text("Failed to allocate captured output buffer.\n");
+                if (buffer != NULL) {
+                    total_size = strlen(buffer);
+                } else {
+                    total_size = 0;
+                }
+                break;
+            }
+
+            buffer = resized_buffer;
+            capacity = new_capacity;
         }
-        return exit_requested;
+
+        memcpy(buffer + total_size, chunk, (size_t) bytes_read);
+        total_size += (size_t) bytes_read;
     }
 
-    file_size = ftell(capture_file);
-    if (file_size < 0) {
-        fclose(capture_file);
-        *captured_output = duplicate_text("Failed to read captured output size.\n");
-        if (*captured_output != NULL) {
-            *captured_size = strlen(*captured_output);
-        }
-        return exit_requested;
-    }
+    close(pipe_fd[0]);
 
-    if (fseek(capture_file, 0L, SEEK_SET) != 0) {
-        fclose(capture_file);
-        *captured_output = duplicate_text("Failed to rewind captured output.\n");
-        if (*captured_output != NULL) {
-            *captured_size = strlen(*captured_output);
-        }
-        return exit_requested;
-    }
-
-    buffer = malloc((size_t) file_size + 1);
-    if (buffer == NULL) {
-        fclose(capture_file);
-        *captured_output = duplicate_text("Failed to allocate captured output buffer.\n");
-        if (*captured_output != NULL) {
-            *captured_size = strlen(*captured_output);
-        }
-        return exit_requested;
-    }
-
-    if (file_size > 0 &&
-        fread(buffer, 1, (size_t) file_size, capture_file) != (size_t) file_size) {
+    if (waitpid(child_pid, &child_status, 0) < 0) {
         free(buffer);
-        fclose(capture_file);
+        *captured_output = duplicate_text("Failed to wait for capture process.\n");
+        if (*captured_output != NULL) {
+            *captured_size = strlen(*captured_output);
+        }
+        return 0;
+    }
+
+    if (bytes_read < 0) {
+        free(buffer);
         *captured_output = duplicate_text("Failed to read captured output bytes.\n");
         if (*captured_output != NULL) {
             *captured_size = strlen(*captured_output);
         }
-        return exit_requested;
+        return WIFEXITED(child_status) && WEXITSTATUS(child_status) == 1;
     }
 
-    buffer[file_size] = '\0';
-    *captured_output = buffer;
-    *captured_size = (size_t) file_size;
+    if (buffer == NULL) {
+        buffer = malloc(1);
+        if (buffer == NULL) {
+            *captured_output = duplicate_text("Failed to allocate captured output buffer.\n");
+            if (*captured_output != NULL) {
+                *captured_size = strlen(*captured_output);
+            }
+            return WIFEXITED(child_status) && WEXITSTATUS(child_status) == 1;
+        }
+    }
 
-    fclose(capture_file);
-    return exit_requested;
+    buffer[total_size] = '\0';
+    *captured_output = buffer;
+    *captured_size = total_size;
+
+    return WIFEXITED(child_status) && WEXITSTATUS(child_status) == 1;
 }
 
 /*
