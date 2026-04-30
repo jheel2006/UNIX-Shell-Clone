@@ -210,6 +210,9 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
+    printf("Connected to a server\n");
+    fflush(stdout);
+
     while (1) {
         char *server_reply;
         size_t reply_size;
@@ -219,7 +222,7 @@ int main(void) {
          * Re-prompt after every completed round trip so the remote
          * client behaves like an interactive shell session.
          */
-        printf("$ ");
+        printf(">>> ");
         fflush(stdout);
 
         if (fgets(command, sizeof(command), stdin) == NULL) {
