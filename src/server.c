@@ -53,6 +53,22 @@ static int scheduler_started = 0;
 static int next_client_number = 1;
 static int next_thread_number = 1;
 
+/* Timeline tracking for summary */
+typedef struct {
+    int client_id;
+    int duration;  /* cumulative end timestamp */
+} TimelineSlice;
+
+#define MAX_TIMELINE_SLICES 100
+static TimelineSlice timeline[MAX_TIMELINE_SLICES];
+static int timeline_count = 0;
+static int had_preemption = 0;
+static int current_running_client = -1;
+static int current_slice_start_time = 0;
+
+/* Forward declaration for summary printing */
+static void print_summary_if_needed(void);
+
 static int send_all(int socket_fd, const void *buffer, size_t length) {
     const char *cursor = buffer;
     size_t total_sent = 0;
@@ -149,7 +165,7 @@ static void log_connection_open(const ClientContext *client) {
               ip_address,
               sizeof(ip_address));
 
-    log_line("[%d]<<< client connected from %s:%d assigned to Thread-%d\n",
+    log_line("[%d]<<< client connected\n",
              client->client_number,
              ip_address,
              ntohs(client->address.sin_port),
@@ -170,6 +186,16 @@ static void log_sent(const ClientContext *client, size_t bytes_sent) {
 
 static void log_task_state(const Task *task, const char *state, int value) {
     log_line("(%d)--- %s (%d)\n", task->client_number, state, value);
+}
+
+static void append_timeline_slice(int client_id, int end_timestamp) {
+    pthread_mutex_lock(&counter_mutex);
+    if (timeline_count < MAX_TIMELINE_SLICES) {
+        timeline[timeline_count].client_id = client_id;
+        timeline[timeline_count].duration = end_timestamp;
+        timeline_count++;
+    }
+    pthread_mutex_unlock(&counter_mutex);
 }
 
 static int is_demo_command(const char *command) {
@@ -227,7 +253,11 @@ static char **build_demo_argv(const char *command, int *iterations_out) {
             memset(&argv[argc], 0, (size_t) (capacity - argc) * sizeof(char *));
         }
 
-        argv[argc] = duplicate_text(token);
+        if (argc == 0 && strcmp(token, "demo") == 0) {
+            argv[argc] = duplicate_text("./demo");
+        } else {
+            argv[argc] = duplicate_text(token);
+        }
         if (argv[argc] == NULL) {
             free_string_array(argv);
             free(copy);
@@ -522,13 +552,18 @@ static void scheduler_logger(const char *event,
     if (strcmp(event, "enqueue") == 0) {
         log_task_state(task, "created", task->remaining_burst);
     } else if (strcmp(event, "dispatch") == 0) {
-        log_task_state(task, task->rounds_completed == 0 ? "started" : "resumed", task->remaining_burst);
+        /* Only log "started" for first round, otherwise just dispatch happens */
+        if (task->rounds_completed == 0) {
+            log_task_state(task, "started", task->remaining_burst);
+        }
     } else if (strcmp(event, "requeue") == 0 || strcmp(event, "preempt-request") == 0) {
         log_task_state(task, "waiting", task->remaining_burst);
     } else if (strcmp(event, "finish") == 0) {
-        log_task_state(task, "ended", 0);
+            int ended_val = task->type == TASK_TYPE_SHELL ? -1 : task->remaining_burst;
+            log_task_state(task, "ended", ended_val);
     } else if (strcmp(event, "cancel") == 0) {
-        log_task_state(task, "ended", -1);
+            int ended_val = task->type == TASK_TYPE_SHELL ? -1 : task->remaining_burst;
+            log_task_state(task, "ended", ended_val);
     }
 }
 
@@ -566,6 +601,8 @@ static TaskRunResult execute_shell_task(Task *task, TaskContext *context) {
 
 static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *context) {
     int slice;
+    int slices_run = 0;
+    int slice_end_timestamp = 0;
 
     if (context->argv == NULL) {
         char *msg = duplicate_text("Invalid program task.\n");
@@ -596,17 +633,34 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
 
         if (scheduler_task_should_cancel(&scheduler, task) || task->cancel_requested) {
             task_context_terminate_child(context);
+            /* Update timeline with actual slices run */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
+            }
             return TASK_RUN_CANCELLED;
         }
 
         log_task_state(task, "running", task->remaining_burst);
         sleep(1);
+        slices_run++;
 
         if (task_context_drain_pipe(context) != 0) {
             task_context_terminate_child(context);
             char *msg = duplicate_text("Failed while capturing program output.\n");
             if (msg != NULL) {
                 task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+            }
+            /* Update timeline */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
             }
             return TASK_RUN_FAILED;
         }
@@ -626,9 +680,21 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
                 if (msg != NULL) {
                     task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
                 }
+                /* Update timeline */
+                pthread_mutex_lock(&counter_mutex);
+                current_slice_start_time += slices_run;
+                pthread_mutex_unlock(&counter_mutex);
                 return TASK_RUN_FAILED;
             }
 
+            /* Update timeline */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
+            }
             task_context_set_done(context, SERVER_CONTINUE, context->output, context->output_size);
             return TASK_RUN_COMPLETE;
         }
@@ -640,7 +706,24 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
                 if (msg != NULL) {
                     task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
                 }
+                /* Update timeline */
+                pthread_mutex_lock(&counter_mutex);
+                current_slice_start_time += slices_run;
+                slice_end_timestamp = current_slice_start_time;
+                pthread_mutex_unlock(&counter_mutex);
+                if (slices_run > 0) {
+                    append_timeline_slice(task->client_number, slice_end_timestamp);
+                }
                 return TASK_RUN_FAILED;
+            }
+            /* Update timeline */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            had_preemption = 1;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
             }
             return TASK_RUN_REQUEUE;
         }
@@ -653,7 +736,24 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
             if (msg != NULL) {
                 task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
             }
+            /* Update timeline */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
+            }
             return TASK_RUN_FAILED;
+        }
+        /* Update timeline */
+        pthread_mutex_lock(&counter_mutex);
+        current_slice_start_time += slices_run;
+        slice_end_timestamp = current_slice_start_time;
+        had_preemption = 1;
+        pthread_mutex_unlock(&counter_mutex);
+        if (slices_run > 0) {
+            append_timeline_slice(task->client_number, slice_end_timestamp);
         }
         return TASK_RUN_REQUEUE;
     }
@@ -669,11 +769,58 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
         if (msg != NULL) {
             task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
         }
+        /* Update timeline */
+        pthread_mutex_lock(&counter_mutex);
+        current_slice_start_time += slices_run;
+        slice_end_timestamp = current_slice_start_time;
+        pthread_mutex_unlock(&counter_mutex);
+        if (slices_run > 0) {
+            append_timeline_slice(task->client_number, slice_end_timestamp);
+        }
         return TASK_RUN_FAILED;
     }
 
+    /* Update timeline */
+    pthread_mutex_lock(&counter_mutex);
+    current_slice_start_time += slices_run;
+    slice_end_timestamp = current_slice_start_time;
+    pthread_mutex_unlock(&counter_mutex);
+    if (slices_run > 0) {
+        append_timeline_slice(task->client_number, slice_end_timestamp);
+    }
     task_context_set_done(context, SERVER_CONTINUE, context->output, context->output_size);
     return TASK_RUN_COMPLETE;
+}
+
+static void print_summary_if_needed(void) {
+    pthread_mutex_lock(&counter_mutex);
+    
+    /* Only print if preemption occurred and we have timeline data */
+    if (had_preemption && timeline_count > 0) {
+        /* Build the timeline string like: (0)-P6-(3)-P7-(6)-P6-(13)-P7-(2) */
+        char timeline_str[1024];
+        timeline_str[0] = '\0';
+        strlcat(timeline_str, "(0)", sizeof(timeline_str));
+        int i;
+        for (i = 0; i < timeline_count; i++) {
+            char segment[64];
+            snprintf(segment, sizeof(segment), "P%d-(%d)",
+                     timeline[i].client_id, timeline[i].duration);
+            strlcat(timeline_str, "-", sizeof(timeline_str));
+            strlcat(timeline_str, segment, sizeof(timeline_str));
+        }
+
+        /* Print single-line summary */
+        log_line("%s\n", timeline_str);
+
+        /* Reset for next batch */
+        had_preemption = 0;
+        timeline_count = 0;
+        current_running_client = -1;
+        current_slice_start_time = 0;
+    }
+    
+    pthread_mutex_unlock(&counter_mutex);
 }
 
 static TaskRunResult server_task_executor(Task *task, int quantum, void *callback_context) {
@@ -809,6 +956,12 @@ static int handle_task_response(ClientContext *client, TaskContext *context) {
     return 0;
 }
 
+static void maybe_print_summary_when_idle(void) {
+    if (!scheduler_has_active_work(&scheduler)) {
+        print_summary_if_needed();
+    }
+}
+
 static void *handle_client(void *arg) {
     ClientContext *client = arg;
 
@@ -853,6 +1006,8 @@ static void *handle_client(void *arg) {
                     break;
                 }
 
+                maybe_print_summary_when_idle();
+
                 task_context_release(context);
                 continue;
             }
@@ -881,6 +1036,8 @@ static void *handle_client(void *arg) {
                 break;
             }
 
+            maybe_print_summary_when_idle();
+
             task_context_release(context);
         }
     }
@@ -901,7 +1058,7 @@ int main(void) {
                        server_task_executor,
                        server_task_cleanup,
                        scheduler_logger,
-                       NULL) != 0) {
+                       &scheduler) != 0) {
         fprintf(stderr, "[ERROR] Failed to initialize scheduler.\n");
         return EXIT_FAILURE;
     }
