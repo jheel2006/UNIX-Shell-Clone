@@ -191,7 +191,7 @@ static void log_sent(const ClientContext *client, size_t bytes_sent) {
 static void log_sent_and_ended(int client_number, int ended_value, size_t bytes_sent) {
     pthread_mutex_lock(&log_mutex);
     printf("[%d]<<< %zu bytes sent\n", client_number, bytes_sent);
-    printf("(%d)--- ended (%d)\n", client_number, ended_value);
+    printf("(%d)--- \033[31m%s\033[0m (%d)\n", client_number, "ended", ended_value);
     fflush(stdout);
     pthread_mutex_unlock(&log_mutex);
 }
@@ -217,7 +217,22 @@ static void log_task_state(const Task *task, const char *state, int value) {
         ctx->last_state[sizeof(ctx->last_state) - 1] = '\0';
     }
 
-    log_line("(%d)--- %s (%d)\n", task->client_number, state, value);
+    /* Add ANSI color codes to state words */
+    const char *color = "";
+    const char *reset = "\033[0m";
+    if (strcmp(state, "created") == 0) {
+        color = "\033[34m";  /* blue */
+    } else if (strcmp(state, "started") == 0 || strcmp(state, "running") == 0) {
+        color = "\033[32m";  /* green */
+    } else if (strcmp(state, "waiting") == 0) {
+        color = "\033[33m";  /* yellow */
+    } else if (strcmp(state, "ended") == 0) {
+        color = "\033[31m";  /* red */
+    }
+
+    char state_colored[64];
+    snprintf(state_colored, sizeof(state_colored), "%s%s%s", color, state, reset);
+    log_line("(%d)--- %s (%d)\n", task->client_number, state_colored, value);
 }
 
 static void append_timeline_slice(int client_id, int end_timestamp) {
@@ -867,8 +882,8 @@ static void print_summary_if_needed(void) {
             strlcat(timeline_str, segment, sizeof(timeline_str));
         }
 
-        /* Print single-line summary */
-        log_line("%s\n", timeline_str);
+        /* Print single-line summary with light blue (cyan) background */
+        log_line("\033[46m%s\033[0m\n", timeline_str);
 
         /* Reset for next batch */
         had_preemption = 0;
