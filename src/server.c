@@ -23,6 +23,7 @@
 #define BUFFER_SIZE 1024
 #define SERVER_CONTINUE 0U
 #define SERVER_EXIT 1U
+#define SERVER_PROGRESS 2U
 #define DEMO_DEFAULT_BURST 5
 
 typedef struct {
@@ -40,6 +41,7 @@ typedef struct TaskContext {
     int response_status;
     char *output;
     size_t output_size;
+    size_t bytes_sent_total;
     char **argv;
     pid_t child_pid;
     int child_running;
@@ -49,6 +51,9 @@ typedef struct TaskContext {
     int final_task_type;
     int final_remaining;
     int socket_fd_for_streaming;  /* for streaming output during execution */
+    int initial_burst;  /* track initial burst for progress display */
+    int socket_fd;  /* client socket for sending progress updates */
+    int last_progress_reported;  /* track last reported progress to avoid duplicates */
 } TaskContext;
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -90,7 +95,11 @@ static int send_all(int socket_fd, const void *buffer, size_t length) {
 
     return 0;
 }
-
+/*
+ * recv_command
+ * -----------------------
+ * Reads from the socket until a null terminator is found, indicating the end
+ */
 static ssize_t recv_command(int socket_fd, char *buffer, size_t buffer_size) {
     size_t used = 0;
 
@@ -119,6 +128,11 @@ static ssize_t recv_command(int socket_fd, char *buffer, size_t buffer_size) {
     return (ssize_t) used;
 }
 
+/*
+ * duplicate_text
+ * -----------------------
+ * Small helper used when creating scheduler task records.
+ */
 static char *duplicate_text(const char *text) {
     size_t length;
     char *copy;
@@ -137,6 +151,11 @@ static char *duplicate_text(const char *text) {
     return copy;
 }
 
+/*
+ * free string array
+ * -----------------------
+ * Helper to free a null-terminated array of strings, used for demo command parsing.
+ */
 static void free_string_array(char **items) {
     int i;
 
@@ -150,6 +169,11 @@ static void free_string_array(char **items) {
     free(items);
 }
 
+/*
+ * log_line
+ * -----------------------
+ * Thread-safe logging helper that takes printf-style arguments and adds a newline.
+ */
 static void log_line(const char *fmt, ...) {
     va_list args;
 
@@ -161,6 +185,11 @@ static void log_line(const char *fmt, ...) {
     pthread_mutex_unlock(&log_mutex);
 }
 
+/*
+ * log_connection_open
+ * -----------------------
+ * Logs when a new client connection is established, including the client's IP and port.
+ */
 static void log_connection_open(const ClientContext *client) {
     char ip_address[INET_ADDRSTRLEN];
 
@@ -176,18 +205,38 @@ static void log_connection_open(const ClientContext *client) {
              client->thread_number);
 }
 
+/*
+ * log_disconnect
+ * -----------------------
+ * Logs when a client disconnects, including the reason for the disconnection.
+ */
 static void log_disconnect(const ClientContext *client, const char *reason) {
     log_line("[%d]<<< %s\n", client->client_number, reason);
 }
 
+/*
+ * log_received
+ * -----------------------
+ * Logs a received command from the client.
+ */
 static void log_received(const ClientContext *client, const char *command) {
     log_line("[%d]>>> %s\n", client->client_number, command);
 }
 
+/*
+ * log_sent
+ * -----------------------
+ * Logs when a response is sent to the client, including the size of the response.
+ */
 static void log_sent(const ClientContext *client, size_t bytes_sent) {
     log_line("[%d]<<< %zu bytes sent\n", client->client_number, bytes_sent);
 }
 
+/*
+ * log_sent_and_ended
+ * -----------------------
+ * Logs both the bytes sent and the task completion status in one entry.
+ */
 static void log_sent_and_ended(int client_number, int ended_value, size_t bytes_sent) {
     pthread_mutex_lock(&log_mutex);
     printf("[%d]<<< %zu bytes sent\n", client_number, bytes_sent);
@@ -196,17 +245,12 @@ static void log_sent_and_ended(int client_number, int ended_value, size_t bytes_
     pthread_mutex_unlock(&log_mutex);
 }
 
+/*
+ * log_task_state
+ * -----------------------
+ * Logs a state change for a task, with ANSI color coding for different states.
+ */
 static void log_task_state(const Task *task, const char *state, int value) {
-    // /* Global suppression: avoid printing the same state for the same client twice in a row */
-    // if (task != NULL) {
-    //     if (last_logged_client == task->client_number && strcmp(last_logged_state, state) == 0) {
-    //         return;
-    //     }
-    //     last_logged_client = task->client_number;
-    //     strncpy(last_logged_state, state, sizeof(last_logged_state) - 1);
-    //     last_logged_state[sizeof(last_logged_state) - 1] = '\0';
-    // }
-
     /* Per-context suppression (fallback) */
     if (task != NULL && task->user_data != NULL) {
         TaskContext *ctx = (TaskContext *) task->user_data;
@@ -235,6 +279,11 @@ static void log_task_state(const Task *task, const char *state, int value) {
     log_line("(%d)--- %s (%d)\n", task->client_number, state_colored, value);
 }
 
+/*
+ * append_timeline_slice
+ * -----------------------
+ * Helper to track execution slices for summary printing.
+ */
 static void append_timeline_slice(int client_id, int end_timestamp) {
     pthread_mutex_lock(&counter_mutex);
     if (timeline_count < MAX_TIMELINE_SLICES) {
@@ -245,6 +294,11 @@ static void append_timeline_slice(int client_id, int end_timestamp) {
     pthread_mutex_unlock(&counter_mutex);
 }
 
+/*
+ * print_summary_if_needed
+ * -----------------------
+ * Prints the execution summary if all tasks have completed.
+ */
 static int is_demo_command(const char *command) {
     return command != NULL &&
            (strncmp(command, "./demo", 6) == 0 || strncmp(command, "demo", 4) == 0) &&
@@ -253,6 +307,11 @@ static int is_demo_command(const char *command) {
             command[6] == '\0' || command[6] == ' ' || command[6] == '\t');
 }
 
+/*
+ * build_demo_argv
+ * -----------------------
+ * Parses a demo command and builds an argv array for execution, also extracting the iteration count.
+ */
 static char **build_demo_argv(const char *command, int *iterations_out) {
     char *copy;
     char *saveptr = NULL;
@@ -346,6 +405,11 @@ static char **build_demo_argv(const char *command, int *iterations_out) {
     return argv;
 }
 
+/*
+ * task_context_create
+ * -----------------------
+ * Allocates and initializes a TaskContext structure for tracking task execution and progress.
+ */
 static TaskContext *task_context_create(void) {
     TaskContext *context = calloc(1, sizeof(*context));
 
@@ -361,6 +425,10 @@ static TaskContext *task_context_create(void) {
     context->final_task_type = -1;
     context->final_remaining = -1;
     context->socket_fd_for_streaming = -1;
+    context->initial_burst = 0;
+    context->socket_fd = -1;
+    context->last_progress_reported = 0;
+    context->bytes_sent_total = 0;
 
     if (pthread_mutex_init(&context->mutex, NULL) != 0) {
         free(context);
@@ -376,6 +444,11 @@ static TaskContext *task_context_create(void) {
     return context;
 }
 
+/*
+ * task_context_release
+ * -----------------------
+ * Decrements the reference count of a TaskContext and frees it if the count reaches zero.
+ */
 static void task_context_release(TaskContext *context) {
     int free_now = 0;
 
@@ -410,6 +483,11 @@ static void task_context_release(TaskContext *context) {
     free(context);
 }
 
+/*
+ * task_context_set_done
+ * -----------------------
+ * Marks a TaskContext as done, setting the final response status and output, and signals any waiting threads.
+ */
 static void task_context_set_done(TaskContext *context,
                                   int status,
                                   char *output,
@@ -418,11 +496,19 @@ static void task_context_set_done(TaskContext *context,
     context->response_status = status;
     context->output = output;
     context->output_size = output_size;
+    if (context->initial_burst <= 0) {
+        context->bytes_sent_total = output_size;
+    }
     context->done = 1;
     pthread_cond_broadcast(&context->ready);
     pthread_mutex_unlock(&context->mutex);
 }
 
+/*
+ * task_context_append
+ * -----------------------
+ * Appends data to the output buffer of a TaskContext, resizing as needed. Used for accumulating command output.
+ */
 static int task_context_append(TaskContext *context, const char *data, size_t size) {
     size_t required = context->output_size + size + 1;
     char *resized;
@@ -450,6 +536,12 @@ static int task_context_append(TaskContext *context, const char *data, size_t si
     return 0;
 }
 
+/*
+ * task_context_drain_pipe
+ * -----------------------
+ * Drains data from the pipe associated with a TaskContext, appending it to the output buffer or sending it over the socket.
+ */
+
 static int task_context_drain_pipe(TaskContext *context) {
     char buffer[512];
 
@@ -460,8 +552,20 @@ static int task_context_drain_pipe(TaskContext *context) {
     while (1) {
         ssize_t n = read(context->pipe_fd, buffer, sizeof(buffer));
         if (n > 0) {
-            if (task_context_append(context, buffer, (size_t) n) != 0) {
-                return -1;
+            if (context->initial_burst > 0 && context->socket_fd >= 0) {
+                uint32_t net_status = htonl(SERVER_PROGRESS);
+                uint32_t net_size = htonl((uint32_t) n);
+
+                if (send_all(context->socket_fd, &net_status, sizeof(net_status)) != 0 ||
+                    send_all(context->socket_fd, &net_size, sizeof(net_size)) != 0 ||
+                    send_all(context->socket_fd, buffer, (size_t) n) != 0) {
+                    return -1;
+                }
+                context->bytes_sent_total += (size_t) n;
+            } else {
+                if (task_context_append(context, buffer, (size_t) n) != 0) {
+                    return -1;
+                }
             }
             continue;
         }
@@ -482,6 +586,11 @@ static int task_context_drain_pipe(TaskContext *context) {
     return 0;
 }
 
+/*
+ * task_context_stop_child
+ * -----------------------
+ * Stops the child process associated with a TaskContext, if it is running.
+ */
 static void task_context_stop_child(TaskContext *context) {
     if (context->child_pid > 0 && context->child_running) {
         kill(context->child_pid, SIGSTOP);
@@ -489,6 +598,11 @@ static void task_context_stop_child(TaskContext *context) {
     }
 }
 
+/*
+ * task_context_terminate_child
+ * -----------------------
+ * Terminates the child process associated with a TaskContext, if it is running.
+ */
 static void task_context_terminate_child(TaskContext *context) {
     if (context->child_pid > 0) {
         kill(context->child_pid, SIGTERM);
@@ -506,6 +620,11 @@ static void task_context_terminate_child(TaskContext *context) {
     }
 }
 
+/*
+ * task_context_start_child
+ * -----------------------------
+ * Starts the child process for a TaskContext by forking and execing the command, setting up pipes for output capture.
+ */
 static int task_context_start_child(TaskContext *context) {
     int pipe_fd[2];
     pid_t pid;
@@ -546,6 +665,11 @@ static int task_context_start_child(TaskContext *context) {
     return 0;
 }
 
+/*
+ * task_context_resume_child
+ * -----------------------
+ * Resumes the child process associated with a TaskContext if it is stopped.
+ */
 static int task_context_resume_child(TaskContext *context) {
     if (context->child_pid > 0 && !context->child_running) {
         if (kill(context->child_pid, SIGCONT) < 0 && errno != ESRCH) {
@@ -556,6 +680,11 @@ static int task_context_resume_child(TaskContext *context) {
     return 0;
 }
 
+/*
+ * task_context_socket_closed
+ * -----------------------
+ * Checks if the socket associated with a TaskContext has been closed by the client.
+ */
 static int task_context_socket_closed(int socket_fd) {
     char peek;
     ssize_t n = recv(socket_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
@@ -571,6 +700,11 @@ static int task_context_socket_closed(int socket_fd) {
     return 0;
 }
 
+/*
+ * send_response
+ * -----------------------
+ * Helper to send a structured response back to the client, including status and payload.
+ */
 static int send_response(int socket_fd, uint32_t status, const char *payload, size_t payload_size) {
     uint32_t net_status = htonl(status);
     uint32_t net_size = htonl((uint32_t) payload_size);
@@ -590,6 +724,11 @@ static int send_response(int socket_fd, uint32_t status, const char *payload, si
     return 0;
 }
 
+/*
+ * scheduler_logger
+ * -----------------------
+ * Callback function for the scheduler to log task events such as enqueueing, dispatching, waiting, finishing, and cancellation.
+ */
 static void scheduler_logger(const char *event,
                              const Task *task,
                              int quantum,
@@ -616,7 +755,7 @@ static void scheduler_logger(const char *event,
         if (task->user_data != NULL) {
             TaskContext *ctx = (TaskContext *) task->user_data;
             pthread_mutex_lock(&ctx->mutex);
-            bytes_sent = ctx->output_size;
+            bytes_sent = ctx->bytes_sent_total;
             pthread_mutex_unlock(&ctx->mutex);
         }
         log_sent_and_ended(task->client_number, ended_val, bytes_sent);
@@ -626,13 +765,18 @@ static void scheduler_logger(const char *event,
         if (task->user_data != NULL) {
             TaskContext *ctx = (TaskContext *) task->user_data;
             pthread_mutex_lock(&ctx->mutex);
-            bytes_sent = ctx->output_size;
+            bytes_sent = ctx->bytes_sent_total;
             pthread_mutex_unlock(&ctx->mutex);
         }
         log_sent_and_ended(task->client_number, ended_val, bytes_sent);
     }
 }
 
+/*
+ * execute_shell_task
+ * -----------------------
+ * Executes a shell command task by invoking the shell execution function and capturing its output, then marking the task as done.
+ */
 static TaskRunResult execute_shell_task(Task *task, TaskContext *context) {
     char *line_copy = duplicate_text(task->command_text);
     char *captured_output = NULL;
@@ -665,6 +809,11 @@ static TaskRunResult execute_shell_task(Task *task, TaskContext *context) {
     return TASK_RUN_COMPLETE;
 }
 
+/*
+ * execute_program_task
+ * -----------------------
+ * Executes a program task by starting or resuming the child process, managing its execution within the given quantum, and handling preemption, cancellation, and output capture.
+ */
 static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *context) {
     int slice;
     int slices_run = 0;
@@ -864,6 +1013,11 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
     return TASK_RUN_COMPLETE;
 }
 
+/*
+ * print_summary_if_needed
+ * -----------------------
+ * Checks if a summary of task execution should be printed (if preemption occurred and we have timeline data), and prints it in a single line with ANSI color coding.
+ */
 static void print_summary_if_needed(void) {
     pthread_mutex_lock(&counter_mutex);
     
@@ -894,6 +1048,11 @@ static void print_summary_if_needed(void) {
     pthread_mutex_unlock(&counter_mutex);
 }
 
+/*
+ * server_task_executor
+ * -----------------------
+ * Main executor function for the scheduler that runs tasks based on their type, handling shell commands and program executions, and returning the appropriate status for the scheduler.
+ */
 static TaskRunResult server_task_executor(Task *task, int quantum, void *callback_context) {
     TaskContext *context = task != NULL ? task->user_data : NULL;
 
@@ -910,6 +1069,11 @@ static TaskRunResult server_task_executor(Task *task, int quantum, void *callbac
     return execute_program_task(task, quantum, context);
 }
 
+/*
+ * server_task_cleanup
+ * -----------------------
+ * Cleanup function for the scheduler to call when a task is finished or cancelled, ensuring that resources are released and final task info is stored for logging.
+ */
 static void server_task_cleanup(Task *task, void *callback_context) {
     TaskContext *context = task != NULL ? task->user_data : NULL;
 
@@ -925,6 +1089,11 @@ static void server_task_cleanup(Task *task, void *callback_context) {
     scheduler_destroy_task(task);
 }
 
+/*
+ * create_shell_task
+ * -----------------------
+ * Helper to create a shell command task with the given command and associate it with a TaskContext for tracking.
+ */
 static Task *create_shell_task(ClientContext *client, const char *command, TaskContext **context_out) {
     TaskContext *context = task_context_create();
     Task *task;
@@ -950,6 +1119,11 @@ static Task *create_shell_task(ClientContext *client, const char *command, TaskC
     return task;
 }
 
+/*
+ * create_program_task
+ * -----------------------
+ * Helper to create a program execution task based on a demo command, parsing the command for arguments and iterations, and associating it with a TaskContext for tracking.
+ */
 static Task *create_program_task(ClientContext *client,
                                  const char *command,
                                  TaskContext **context_out) {
@@ -970,6 +1144,8 @@ static Task *create_program_task(ClientContext *client,
     }
 
     context->argv = argv;
+    context->initial_burst = iterations;
+    context->socket_fd = client->socket_fd;
 
     task = scheduler_create_task(TASK_TYPE_PROGRAM,
                                  client->client_number,
@@ -988,6 +1164,11 @@ static Task *create_program_task(ClientContext *client,
     return task;
 }
 
+/*
+ * wait_for_task
+ * -----------------------
+ * Waits for a task to complete by waiting on its TaskContext's condition variable, while also checking for client disconnection to cancel the task if needed.
+ */
 static int wait_for_task(TaskContext *context, ClientContext *client) {
     struct timeval tv;
     struct timespec ts;
@@ -1017,6 +1198,11 @@ static int wait_for_task(TaskContext *context, ClientContext *client) {
     }
 }
 
+/*
+ * handle_task_response
+ * -----------------------
+ * Sends the response for a completed task back to the client, including the status and any output payload.
+ */
 static int handle_task_response(ClientContext *client, TaskContext *context) {
     int status;
     char *payload;
@@ -1035,12 +1221,22 @@ static int handle_task_response(ClientContext *client, TaskContext *context) {
     return 0;
 }
 
+/*
+ * maybe_print_summary_when_idle
+ * -----------------------
+ * Checks if the scheduler is currently idle (no active tasks) and if so, prints a summary of recent task execution if needed.
+ */
 static void maybe_print_summary_when_idle(void) {
     if (!scheduler_has_active_work(&scheduler)) {
         print_summary_if_needed();
     }
 }
 
+/*
+ * handle_client
+ * -----------------------
+ * Main loop for handling a connected client, receiving commands, creating tasks, waiting for their completion, and sending responses, while also handling disconnections and logging.
+ */
 static void *handle_client(void *arg) {
     ClientContext *client = arg;
 
@@ -1126,6 +1322,11 @@ static void *handle_client(void *arg) {
     return NULL;
 }
 
+/*
+ * main
+ * -----------------------
+ * Entry point of the server application, setting up the scheduler, initializing the server socket, accepting client connections, and spawning threads to handle each client.
+ */
 int main(void) {
     int opt = 1;
     int server_socket;
