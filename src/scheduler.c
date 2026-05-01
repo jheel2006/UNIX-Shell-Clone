@@ -76,9 +76,7 @@ static void enqueue_task_locked(Scheduler *scheduler, Task *task) {
 /*
  * choose_shortest_program_locked
  * ------------------------------
- * Selects the shortest remaining program task. If the shortest task is
- * the same one chosen in the previous round, the scheduler avoids
- * selecting it consecutively when another program is available.
+ * Selects the shortest remaining program task.
  *
  * The caller must already hold scheduler->mutex.
  */
@@ -113,6 +111,7 @@ static Task *choose_shortest_program_locked(Scheduler *scheduler) {
         cursor = cursor->next;
     }
 
+    /* Fairness: avoid selecting the exact same program twice in a row when another is available */
     if (best != NULL &&
         best->task_id == scheduler->last_selected_task_id &&
         best_alt != NULL) {
@@ -285,8 +284,8 @@ static void *scheduler_main(void *arg) {
             task->rounds_completed++;
             task->state = TASK_STATE_WAITING;
             task->preempt_requested = 0;
+            log_scheduler_event(scheduler, "waiting", task, quantum);
             enqueue_task_locked(scheduler, task);
-            log_scheduler_event(scheduler, "requeue", task, quantum);
             scheduler->queued_signal_count++;
             pthread_cond_signal(&scheduler->queue_ready);
             pthread_mutex_unlock(&scheduler->mutex);

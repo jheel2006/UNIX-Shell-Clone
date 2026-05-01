@@ -44,6 +44,11 @@ typedef struct TaskContext {
     pid_t child_pid;
     int child_running;
     int pipe_fd;
+    struct Task *task_ref;
+    char last_state[16];
+    int final_task_type;
+    int final_remaining;
+    int socket_fd_for_streaming;  /* for streaming output during execution */
 } TaskContext;
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -63,7 +68,6 @@ typedef struct {
 static TimelineSlice timeline[MAX_TIMELINE_SLICES];
 static int timeline_count = 0;
 static int had_preemption = 0;
-static int current_running_client = -1;
 static int current_slice_start_time = 0;
 
 /* Forward declaration for summary printing */
@@ -184,7 +188,35 @@ static void log_sent(const ClientContext *client, size_t bytes_sent) {
     log_line("[%d]<<< %zu bytes sent\n", client->client_number, bytes_sent);
 }
 
+static void log_sent_and_ended(int client_number, int ended_value, size_t bytes_sent) {
+    pthread_mutex_lock(&log_mutex);
+    printf("[%d]<<< %zu bytes sent\n", client_number, bytes_sent);
+    printf("(%d)--- ended (%d)\n", client_number, ended_value);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+}
+
 static void log_task_state(const Task *task, const char *state, int value) {
+    // /* Global suppression: avoid printing the same state for the same client twice in a row */
+    // if (task != NULL) {
+    //     if (last_logged_client == task->client_number && strcmp(last_logged_state, state) == 0) {
+    //         return;
+    //     }
+    //     last_logged_client = task->client_number;
+    //     strncpy(last_logged_state, state, sizeof(last_logged_state) - 1);
+    //     last_logged_state[sizeof(last_logged_state) - 1] = '\0';
+    // }
+
+    /* Per-context suppression (fallback) */
+    if (task != NULL && task->user_data != NULL) {
+        TaskContext *ctx = (TaskContext *) task->user_data;
+        if (ctx->last_state[0] != '\0' && strcmp(ctx->last_state, state) == 0) {
+            return;
+        }
+        strncpy(ctx->last_state, state, sizeof(ctx->last_state) - 1);
+        ctx->last_state[sizeof(ctx->last_state) - 1] = '\0';
+    }
+
     log_line("(%d)--- %s (%d)\n", task->client_number, state, value);
 }
 
@@ -309,6 +341,11 @@ static TaskContext *task_context_create(void) {
     context->refcount = 2;
     context->response_status = SERVER_CONTINUE;
     context->pipe_fd = -1;
+    context->task_ref = NULL;
+    context->last_state[0] = '\0';
+    context->final_task_type = -1;
+    context->final_remaining = -1;
+    context->socket_fd_for_streaming = -1;
 
     if (pthread_mutex_init(&context->mutex, NULL) != 0) {
         free(context);
@@ -556,14 +593,28 @@ static void scheduler_logger(const char *event,
         if (task->rounds_completed == 0) {
             log_task_state(task, "started", task->remaining_burst);
         }
-    } else if (strcmp(event, "requeue") == 0 || strcmp(event, "preempt-request") == 0) {
+    } else if (strcmp(event, "waiting") == 0) {
         log_task_state(task, "waiting", task->remaining_burst);
     } else if (strcmp(event, "finish") == 0) {
-            int ended_val = task->type == TASK_TYPE_SHELL ? -1 : task->remaining_burst;
-            log_task_state(task, "ended", ended_val);
+        int ended_val = task->type == TASK_TYPE_SHELL ? -1 : task->remaining_burst;
+        size_t bytes_sent = 0;
+        if (task->user_data != NULL) {
+            TaskContext *ctx = (TaskContext *) task->user_data;
+            pthread_mutex_lock(&ctx->mutex);
+            bytes_sent = ctx->output_size;
+            pthread_mutex_unlock(&ctx->mutex);
+        }
+        log_sent_and_ended(task->client_number, ended_val, bytes_sent);
     } else if (strcmp(event, "cancel") == 0) {
-            int ended_val = task->type == TASK_TYPE_SHELL ? -1 : task->remaining_burst;
-            log_task_state(task, "ended", ended_val);
+        int ended_val = task->type == TASK_TYPE_SHELL ? -1 : task->remaining_burst;
+        size_t bytes_sent = 0;
+        if (task->user_data != NULL) {
+            TaskContext *ctx = (TaskContext *) task->user_data;
+            pthread_mutex_lock(&ctx->mutex);
+            bytes_sent = ctx->output_size;
+            pthread_mutex_unlock(&ctx->mutex);
+        }
+        log_sent_and_ended(task->client_number, ended_val, bytes_sent);
     }
 }
 
@@ -628,6 +679,12 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
         return TASK_RUN_FAILED;
     }
 
+    /* Log running once at the start of this slice unless this is the very first start
+       (we print "started" from the logger for the first dispatch). */
+    if (task->rounds_completed > 0) {
+        log_task_state(task, "running", task->remaining_burst);
+    }
+
     for (slice = 0; slice < quantum && task->remaining_burst > 0; slice++) {
         int child_status;
 
@@ -644,7 +701,6 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
             return TASK_RUN_CANCELLED;
         }
 
-        log_task_state(task, "running", task->remaining_burst);
         sleep(1);
         slices_run++;
 
@@ -662,7 +718,7 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
             if (slices_run > 0) {
                 append_timeline_slice(task->client_number, slice_end_timestamp);
             }
-            return TASK_RUN_FAILED;
+            return TASK_RUN_REQUEUE;
         }
 
         if (task->remaining_burst > 0) {
@@ -714,7 +770,8 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
                 if (slices_run > 0) {
                     append_timeline_slice(task->client_number, slice_end_timestamp);
                 }
-                return TASK_RUN_FAILED;
+                /* report waiting with updated remaining value */
+                return TASK_RUN_REQUEUE;
             }
             /* Update timeline */
             pthread_mutex_lock(&counter_mutex);
@@ -744,7 +801,7 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
             if (slices_run > 0) {
                 append_timeline_slice(task->client_number, slice_end_timestamp);
             }
-            return TASK_RUN_FAILED;
+            return TASK_RUN_REQUEUE;
         }
         /* Update timeline */
         pthread_mutex_lock(&counter_mutex);
@@ -816,7 +873,6 @@ static void print_summary_if_needed(void) {
         /* Reset for next batch */
         had_preemption = 0;
         timeline_count = 0;
-        current_running_client = -1;
         current_slice_start_time = 0;
     }
     
@@ -845,6 +901,9 @@ static void server_task_cleanup(Task *task, void *callback_context) {
     (void) callback_context;
 
     if (context != NULL) {
+        /* Store final task info into context so client thread can log ended safely */
+        context->final_task_type = task->type;
+        context->final_remaining = task->remaining_burst;
         task_context_release(context);
     }
 
@@ -868,6 +927,9 @@ static Task *create_shell_task(ClientContext *client, const char *command, TaskC
         task_context_release(context);
         return NULL;
     }
+
+    /* link context back to task for later logging */
+    context->task_ref = task;
 
     *context_out = context;
     return task;
@@ -903,6 +965,9 @@ static Task *create_program_task(ClientContext *client,
         task_context_release(context);
         return NULL;
     }
+
+    /* link context back to task for later logging */
+    context->task_ref = task;
 
     *context_out = context;
     return task;
@@ -952,7 +1017,6 @@ static int handle_task_response(ClientContext *client, TaskContext *context) {
         return -1;
     }
 
-    log_sent(client, payload_size);
     return 0;
 }
 
