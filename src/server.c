@@ -1,61 +1,31 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-#include <sys/socket.h>
-#include <sys/types.h>
-
-#include <netinet/in.h>
-
+#include "scheduler.h"
 #include "shell_core.h"
 
-/*
- * PORT
- * ----
- * Shared TCP port used by the client and server.
- */
 #define PORT 9002
-
-/*
- * BACKLOG
- * -------
- * Number of pending client connections the listening socket may queue.
- */
 #define BACKLOG 10
-
-/*
- * BUFFER_SIZE
- * -----------
- * Maximum size of one received command string.
- */
 #define BUFFER_SIZE 1024
-
-/*
- * SERVER_CONTINUE
- * ---------------
- * Response status sent after normal command processing when the server
- * should remain connected and wait for another command from the client.
- */
 #define SERVER_CONTINUE 0U
-
-/*
- * SERVER_EXIT
- * -----------
- * Response status sent when the received command requests a clean
- * end to the remote shell session.
- */
 #define SERVER_EXIT 1U
+#define SERVER_PROGRESS 2U
+#define DEMO_DEFAULT_BURST 5
 
-/*
- * ClientContext
- * -------------
- * Thread-owned session state for one connected client.
- */
 typedef struct {
     int socket_fd;
     int client_number;
@@ -63,29 +33,61 @@ typedef struct {
     struct sockaddr_in address;
 } ClientContext;
 
-/*
- * Global state used only for synchronized server-side logging and for
- * assigning deterministic client/thread numbers to new connections.
- */
+typedef struct TaskContext {
+    pthread_mutex_t mutex;
+    pthread_cond_t ready;
+    int refcount;
+    int done;
+    int response_status;
+    char *output;
+    size_t output_size;
+    size_t bytes_sent_total;
+    char **argv;
+    pid_t child_pid;
+    int child_running;
+    int pipe_fd;
+    struct Task *task_ref;
+    char last_state[16];
+    int final_task_type;
+    int final_remaining;
+    int socket_fd_for_streaming;  /* for streaming output during execution */
+    int initial_burst;  /* track initial burst for progress display */
+    int socket_fd;  /* client socket for sending progress updates */
+    int last_progress_reported;  /* track last reported progress to avoid duplicates */
+} TaskContext;
+
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
+static Scheduler scheduler;
+static int scheduler_started = 0;
 static int next_client_number = 1;
 static int next_thread_number = 1;
 
-/*
- * send_all
- * --------
- * Sends an entire buffer over the connected socket, retrying until all
- * bytes are written or a hard error occurs.
- */
+/* Timeline tracking for summary */
+typedef struct {
+    int client_id;
+    int duration;  /* cumulative end timestamp */
+} TimelineSlice;
+
+#define MAX_TIMELINE_SLICES 100
+static TimelineSlice timeline[MAX_TIMELINE_SLICES];
+static int timeline_count = 0;
+static int had_preemption = 0;
+static int current_slice_start_time = 0;
+
+/* Forward declaration for summary printing */
+static void print_summary_if_needed(void);
+
 static int send_all(int socket_fd, const void *buffer, size_t length) {
     const char *cursor = buffer;
     size_t total_sent = 0;
-    ssize_t sent_now;
 
     while (total_sent < length) {
-        sent_now = send(socket_fd, cursor + total_sent, length - total_sent, 0);
+        ssize_t sent_now = send(socket_fd, cursor + total_sent, length - total_sent, 0);
         if (sent_now <= 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             return -1;
         }
         total_sent += (size_t) sent_now;
@@ -93,96 +95,100 @@ static int send_all(int socket_fd, const void *buffer, size_t length) {
 
     return 0;
 }
-
 /*
- * is_error_output
- * ---------------
- * Best-effort classifier for the text returned by the shared shell path.
- * The server only receives one combined stdout/stderr payload, so this
- * helper uses known assignment error strings and common perror prefixes
- * to decide whether the payload should be described as normal output or
- * an error message in the server log.
+ * recv_command
+ * -----------------------
+ * Reads from the socket until a null terminator is found, indicating the end
  */
-static int is_error_output(const char *payload) {
-    if (payload == NULL || *payload == '\0') {
-        return 0;
+static ssize_t recv_command(int socket_fd, char *buffer, size_t buffer_size) {
+    size_t used = 0;
+
+    if (buffer_size == 0) {
+        return -1;
     }
 
-    return strncmp(payload, "Input file not specified.", 25) == 0 ||
-           strncmp(payload, "Output file not specified.", 26) == 0 ||
-           strncmp(payload, "Error output file not specified.", 32) == 0 ||
-           strncmp(payload, "Command missing after pipe.", 27) == 0 ||
-           strncmp(payload, "Empty command between pipes.", 28) == 0 ||
-           strncmp(payload, "Command not found.", 18) == 0 ||
-           strncmp(payload, "Command not found in pipe sequence.", 35) == 0 ||
-           strncmp(payload, "open:", 5) == 0 ||
-           strncmp(payload, "Unmatched quote", 15) == 0 ||
-           strncmp(payload, "fork:", 5) == 0 ||
-           strncmp(payload, "pipe:", 5) == 0;
+    while (used + 1 < buffer_size) {
+        ssize_t received = recv(socket_fd, buffer + used, 1, 0);
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (received == 0) {
+            return 0;
+        }
+        if (buffer[used] == '\0') {
+            return (ssize_t) used;
+        }
+        used += 1;
+    }
+
+    buffer[buffer_size - 1] = '\0';
+    return (ssize_t) used;
 }
 
 /*
- * print_payload_block
- * -------------------
- * Prints the command payload on the server terminal in a readable way
- * without changing the exact bytes that will be sent back to the client.
+ * duplicate_text
+ * -----------------------
+ * Small helper used when creating scheduler task records.
  */
-static void print_payload_block(const char *payload, size_t payload_size) {
-    if (payload == NULL || payload_size == 0) {
+static char *duplicate_text(const char *text) {
+    size_t length;
+    char *copy;
+
+    if (text == NULL) {
+        return NULL;
+    }
+
+    length = strlen(text);
+    copy = malloc(length + 1);
+    if (copy == NULL) {
+        return NULL;
+    }
+
+    memcpy(copy, text, length + 1);
+    return copy;
+}
+
+/*
+ * free string array
+ * -----------------------
+ * Helper to free a null-terminated array of strings, used for demo command parsing.
+ */
+static void free_string_array(char **items) {
+    int i;
+
+    if (items == NULL) {
         return;
     }
 
-    fwrite(payload, 1, payload_size, stdout);
-    if (payload[payload_size - 1] != '\n') {
-        printf("\n");
+    for (i = 0; items[i] != NULL; i++) {
+        free(items[i]);
     }
+    free(items);
 }
 
 /*
- * print_payload_inline
- * --------------------
- * Prints one payload inline after a log prefix while trimming a final
- * newline if present. This is useful for single-line error messages,
- * where the sample server output keeps the message on the same line.
+ * log_line
+ * -----------------------
+ * Thread-safe logging helper that takes printf-style arguments and adds a newline.
  */
-static void print_payload_inline(const char *payload, size_t payload_size) {
-    size_t printable_size = payload_size;
+static void log_line(const char *fmt, ...) {
+    va_list args;
 
-    if (payload == NULL || payload_size == 0) {
-        return;
-    }
-
-    if (payload[printable_size - 1] == '\n') {
-        printable_size--;
-    }
-
-    fwrite(payload, 1, printable_size, stdout);
-    printf("\n");
-}
-
-/*
- * log_client_prefix
- * -----------------
- * Writes the shared client identity block used in the required output.
- */
-static void log_client_prefix(const ClientContext *client) {
-    char ip_address[INET_ADDRSTRLEN];
-
-    inet_ntop(AF_INET,
-              &client->address.sin_addr,
-              ip_address,
-              sizeof(ip_address));
-
-    printf("[Client #%d - %s:%d]",
-           client->client_number,
-           ip_address,
-           ntohs(client->address.sin_port));
+    pthread_mutex_lock(&log_mutex);
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
 }
 
 /*
  * log_connection_open
- * -------------------
- * Prints the connection assignment message for a newly accepted client.
+ * -----------------------
+ * Logs when a new client connection is established, including the client's IP and port.
  */
 static void log_connection_open(const ClientContext *client) {
     char ip_address[INET_ADDRSTRLEN];
@@ -192,66 +198,388 @@ static void log_connection_open(const ClientContext *client) {
               ip_address,
               sizeof(ip_address));
 
-    pthread_mutex_lock(&log_mutex);
-    printf("[INFO] Client #%d connected from %s:%d. Assigned to Thread-%d.\n",
-           client->client_number,
-           ip_address,
-           ntohs(client->address.sin_port),
-           client->thread_number);
-    fflush(stdout);
-    pthread_mutex_unlock(&log_mutex);
+    log_line("[%d]<<< client connected\n",
+             client->client_number,
+             ip_address,
+             ntohs(client->address.sin_port),
+             client->thread_number);
 }
 
 /*
  * log_disconnect
- * --------------
- * Prints a client disconnect event in the same synchronized log stream.
+ * -----------------------
+ * Logs when a client disconnects, including the reason for the disconnection.
  */
 static void log_disconnect(const ClientContext *client, const char *reason) {
+    log_line("[%d]<<< %s\n", client->client_number, reason);
+}
+
+/*
+ * log_received
+ * -----------------------
+ * Logs a received command from the client.
+ */
+static void log_received(const ClientContext *client, const char *command) {
+    log_line("[%d]>>> %s\n", client->client_number, command);
+}
+
+/*
+ * log_sent
+ * -----------------------
+ * Logs when a response is sent to the client, including the size of the response.
+ */
+static void log_sent(const ClientContext *client, size_t bytes_sent) {
+    log_line("[%d]<<< %zu bytes sent\n", client->client_number, bytes_sent);
+}
+
+/*
+ * log_sent_and_ended
+ * -----------------------
+ * Logs both the bytes sent and the task completion status in one entry.
+ */
+static void log_sent_and_ended(int client_number, int ended_value, size_t bytes_sent) {
     pthread_mutex_lock(&log_mutex);
-
-    if (reason != NULL) {
-        printf("[INFO] ");
-        log_client_prefix(client);
-        printf(" %s\n", reason);
-    }
-
-    printf("[INFO] Client #%d disconnected.\n", client->client_number);
+    printf("[%d]<<< %zu bytes sent\n", client_number, bytes_sent);
+    printf("(%d)--- \033[31m%s\033[0m (%d)\n", client_number, "ended", ended_value);
     fflush(stdout);
     pthread_mutex_unlock(&log_mutex);
 }
 
 /*
- * send_response
- * -------------
- * Sends one complete response packet for a command:
- *   1. 32-bit status code
- *   2. 32-bit payload length
- *   3. payload bytes
- *
- * This packet format lets the server keep the socket open across
- * multiple commands while still allowing the client to determine
- * where each response ends.
+ * log_task_state
+ * -----------------------
+ * Logs a state change for a task, with ANSI color coding for different states.
  */
-static int send_response(int client_socket,
-                         uint32_t status,
-                         const char *payload,
-                         size_t payload_size) {
-    uint32_t network_status = htonl(status);
-    uint32_t network_payload_size = htonl((uint32_t) payload_size);
-
-    if (send_all(client_socket, &network_status, sizeof(network_status)) == -1) {
-        return -1;
+static void log_task_state(const Task *task, const char *state, int value) {
+    /* Per-context suppression (fallback) */
+    if (task != NULL && task->user_data != NULL) {
+        TaskContext *ctx = (TaskContext *) task->user_data;
+        if (ctx->last_state[0] != '\0' && strcmp(ctx->last_state, state) == 0) {
+            return;
+        }
+        strncpy(ctx->last_state, state, sizeof(ctx->last_state) - 1);
+        ctx->last_state[sizeof(ctx->last_state) - 1] = '\0';
     }
 
-    if (send_all(client_socket,
-                 &network_payload_size,
-                 sizeof(network_payload_size)) == -1) {
-        return -1;
+    /* Add ANSI color codes to state words */
+    const char *color = "";
+    const char *reset = "\033[0m";
+    if (strcmp(state, "created") == 0) {
+        color = "\033[34m";  /* blue */
+    } else if (strcmp(state, "started") == 0 || strcmp(state, "running") == 0) {
+        color = "\033[32m";  /* green */
+    } else if (strcmp(state, "waiting") == 0) {
+        color = "\033[33m";  /* yellow */
+    } else if (strcmp(state, "ended") == 0) {
+        color = "\033[31m";  /* red */
     }
 
-    if (payload_size > 0 &&
-        send_all(client_socket, payload, payload_size) == -1) {
+    char state_colored[64];
+    snprintf(state_colored, sizeof(state_colored), "%s%s%s", color, state, reset);
+    log_line("(%d)--- %s (%d)\n", task->client_number, state_colored, value);
+}
+
+/*
+ * append_timeline_slice
+ * -----------------------
+ * Helper to track execution slices for summary printing.
+ */
+static void append_timeline_slice(int client_id, int end_timestamp) {
+    pthread_mutex_lock(&counter_mutex);
+    if (timeline_count < MAX_TIMELINE_SLICES) {
+        timeline[timeline_count].client_id = client_id;
+        timeline[timeline_count].duration = end_timestamp;
+        timeline_count++;
+    }
+    pthread_mutex_unlock(&counter_mutex);
+}
+
+/*
+ * print_summary_if_needed
+ * -----------------------
+ * Prints the execution summary if all tasks have completed.
+ */
+static int is_demo_command(const char *command) {
+    return command != NULL &&
+           (strncmp(command, "./demo", 6) == 0 || strncmp(command, "demo", 4) == 0) &&
+           (command[4] == '\0' || command[4] == ' ' || command[4] == '\t' ||
+            command[5] == '\0' || command[5] == ' ' || command[5] == '\t' ||
+            command[6] == '\0' || command[6] == ' ' || command[6] == '\t');
+}
+
+/*
+ * build_demo_argv
+ * -----------------------
+ * Parses a demo command and builds an argv array for execution, also extracting the iteration count.
+ */
+static char **build_demo_argv(const char *command, int *iterations_out) {
+    char *copy;
+    char *saveptr = NULL;
+    char *token;
+    char **argv;
+    int argc = 0;
+    int capacity = 4;
+    int iterations = DEMO_DEFAULT_BURST;
+
+    if (iterations_out == NULL) {
+        return NULL;
+    }
+
+    *iterations_out = DEMO_DEFAULT_BURST;
+
+    copy = duplicate_text(command);
+    if (copy == NULL) {
+        return NULL;
+    }
+
+    token = strtok_r(copy, " \t", &saveptr);
+    if (token == NULL || !is_demo_command(token)) {
+        free(copy);
+        return NULL;
+    }
+
+    argv = calloc((size_t) capacity, sizeof(char *));
+    if (argv == NULL) {
+        free(copy);
+        return NULL;
+    }
+
+    while (token != NULL) {
+        char **resized;
+
+        if (argc + 1 >= capacity) {
+            capacity *= 2;
+            resized = realloc(argv, (size_t) capacity * sizeof(char *));
+            if (resized == NULL) {
+                free_string_array(argv);
+                free(copy);
+                return NULL;
+            }
+            argv = resized;
+            memset(&argv[argc], 0, (size_t) (capacity - argc) * sizeof(char *));
+        }
+
+        if (argc == 0 && strcmp(token, "demo") == 0) {
+            argv[argc] = duplicate_text("./demo");
+        } else {
+            argv[argc] = duplicate_text(token);
+        }
+        if (argv[argc] == NULL) {
+            free_string_array(argv);
+            free(copy);
+            return NULL;
+        }
+
+        argc++;
+        token = strtok_r(NULL, " \t", &saveptr);
+    }
+
+    if (argc >= 2) {
+        char *end = NULL;
+        long parsed = strtol(argv[1], &end, 10);
+
+        if (end != argv[1] && *end == '\0' && parsed > 0) {
+            iterations = (int) parsed;
+        } else {
+            free(argv[1]);
+            argv[1] = duplicate_text("5");
+            if (argv[1] == NULL) {
+                free_string_array(argv);
+                free(copy);
+                return NULL;
+            }
+        }
+    } else {
+        argv[argc] = duplicate_text("5");
+        if (argv[argc] == NULL) {
+            free_string_array(argv);
+            free(copy);
+            return NULL;
+        }
+        argc++;
+    }
+
+    argv[argc] = NULL;
+    *iterations_out = iterations;
+    free(copy);
+    return argv;
+}
+
+/*
+ * task_context_create
+ * -----------------------
+ * Allocates and initializes a TaskContext structure for tracking task execution and progress.
+ */
+static TaskContext *task_context_create(void) {
+    TaskContext *context = calloc(1, sizeof(*context));
+
+    if (context == NULL) {
+        return NULL;
+    }
+
+    context->refcount = 2;
+    context->response_status = SERVER_CONTINUE;
+    context->pipe_fd = -1;
+    context->task_ref = NULL;
+    context->last_state[0] = '\0';
+    context->final_task_type = -1;
+    context->final_remaining = -1;
+    context->socket_fd_for_streaming = -1;
+    context->initial_burst = 0;
+    context->socket_fd = -1;
+    context->last_progress_reported = 0;
+    context->bytes_sent_total = 0;
+
+    if (pthread_mutex_init(&context->mutex, NULL) != 0) {
+        free(context);
+        return NULL;
+    }
+
+    if (pthread_cond_init(&context->ready, NULL) != 0) {
+        pthread_mutex_destroy(&context->mutex);
+        free(context);
+        return NULL;
+    }
+
+    return context;
+}
+
+/*
+ * task_context_release
+ * -----------------------
+ * Decrements the reference count of a TaskContext and frees it if the count reaches zero.
+ */
+static void task_context_release(TaskContext *context) {
+    int free_now = 0;
+
+    if (context == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&context->mutex);
+    context->refcount--;
+    if (context->refcount == 0) {
+        free_now = 1;
+    }
+    pthread_mutex_unlock(&context->mutex);
+
+    if (!free_now) {
+        return;
+    }
+
+    if (context->pipe_fd >= 0) {
+        close(context->pipe_fd);
+    }
+
+    if (context->child_pid > 0) {
+        kill(context->child_pid, SIGKILL);
+        waitpid(context->child_pid, NULL, 0);
+    }
+
+    free_string_array(context->argv);
+    free(context->output);
+    pthread_cond_destroy(&context->ready);
+    pthread_mutex_destroy(&context->mutex);
+    free(context);
+}
+
+/*
+ * task_context_set_done
+ * -----------------------
+ * Marks a TaskContext as done, setting the final response status and output, and signals any waiting threads.
+ */
+static void task_context_set_done(TaskContext *context,
+                                  int status,
+                                  char *output,
+                                  size_t output_size) {
+    pthread_mutex_lock(&context->mutex);
+    context->response_status = status;
+    context->output = output;
+    context->output_size = output_size;
+    if (context->initial_burst <= 0) {
+        context->bytes_sent_total = output_size;
+    }
+    context->done = 1;
+    pthread_cond_broadcast(&context->ready);
+    pthread_mutex_unlock(&context->mutex);
+}
+
+/*
+ * task_context_append
+ * -----------------------
+ * Appends data to the output buffer of a TaskContext, resizing as needed. Used for accumulating command output.
+ */
+static int task_context_append(TaskContext *context, const char *data, size_t size) {
+    size_t required = context->output_size + size + 1;
+    char *resized;
+
+    if (size == 0) {
+        return 0;
+    }
+
+    if (context->output == NULL) {
+        context->output = malloc(required < 256 ? 256 : required);
+        if (context->output == NULL) {
+            return -1;
+        }
+    } else if (required > context->output_size + 1) {
+        resized = realloc(context->output, required < 256 ? 256 : required);
+        if (resized == NULL) {
+            return -1;
+        }
+        context->output = resized;
+    }
+
+    memcpy(context->output + context->output_size, data, size);
+    context->output_size += size;
+    context->output[context->output_size] = '\0';
+    return 0;
+}
+
+/*
+ * task_context_drain_pipe
+ * -----------------------
+ * Drains data from the pipe associated with a TaskContext, appending it to the output buffer or sending it over the socket.
+ */
+
+static int task_context_drain_pipe(TaskContext *context) {
+    char buffer[512];
+
+    if (context->pipe_fd < 0) {
+        return 0;
+    }
+
+    while (1) {
+        ssize_t n = read(context->pipe_fd, buffer, sizeof(buffer));
+        if (n > 0) {
+            if (context->initial_burst > 0 && context->socket_fd >= 0) {
+                uint32_t net_status = htonl(SERVER_PROGRESS);
+                uint32_t net_size = htonl((uint32_t) n);
+
+                if (send_all(context->socket_fd, &net_status, sizeof(net_status)) != 0 ||
+                    send_all(context->socket_fd, &net_size, sizeof(net_size)) != 0 ||
+                    send_all(context->socket_fd, buffer, (size_t) n) != 0) {
+                    return -1;
+                }
+                context->bytes_sent_total += (size_t) n;
+            } else {
+                if (task_context_append(context, buffer, (size_t) n) != 0) {
+                    return -1;
+                }
+            }
+            continue;
+        }
+
+        if (n == 0) {
+            close(context->pipe_fd);
+            context->pipe_fd = -1;
+            break;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            break;
+        }
+
         return -1;
     }
 
@@ -259,94 +587,733 @@ static int send_response(int client_socket,
 }
 
 /*
+ * task_context_stop_child
+ * -----------------------
+ * Stops the child process associated with a TaskContext, if it is running.
+ */
+static void task_context_stop_child(TaskContext *context) {
+    if (context->child_pid > 0 && context->child_running) {
+        kill(context->child_pid, SIGSTOP);
+        context->child_running = 0;
+    }
+}
+
+/*
+ * task_context_terminate_child
+ * -----------------------
+ * Terminates the child process associated with a TaskContext, if it is running.
+ */
+static void task_context_terminate_child(TaskContext *context) {
+    if (context->child_pid > 0) {
+        kill(context->child_pid, SIGTERM);
+        usleep(100000);
+        kill(context->child_pid, SIGKILL);
+        waitpid(context->child_pid, NULL, 0);
+    }
+
+    context->child_pid = -1;
+    context->child_running = 0;
+
+    if (context->pipe_fd >= 0) {
+        close(context->pipe_fd);
+        context->pipe_fd = -1;
+    }
+}
+
+/*
+ * task_context_start_child
+ * -----------------------------
+ * Starts the child process for a TaskContext by forking and execing the command, setting up pipes for output capture.
+ */
+static int task_context_start_child(TaskContext *context) {
+    int pipe_fd[2];
+    pid_t pid;
+
+    if (pipe(pipe_fd) < 0) {
+        return -1;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        if (dup2(pipe_fd[1], STDOUT_FILENO) < 0 || dup2(pipe_fd[1], STDERR_FILENO) < 0) {
+            _exit(EXIT_FAILURE);
+        }
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        execvp(context->argv[0], context->argv);
+        perror("execvp");
+        _exit(EXIT_FAILURE);
+    }
+
+    close(pipe_fd[1]);
+    if (fcntl(pipe_fd[0], F_SETFL, O_NONBLOCK) < 0) {
+        close(pipe_fd[0]);
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+
+    context->child_pid = pid;
+    context->child_running = 1;
+    context->pipe_fd = pipe_fd[0];
+    return 0;
+}
+
+/*
+ * task_context_resume_child
+ * -----------------------
+ * Resumes the child process associated with a TaskContext if it is stopped.
+ */
+static int task_context_resume_child(TaskContext *context) {
+    if (context->child_pid > 0 && !context->child_running) {
+        if (kill(context->child_pid, SIGCONT) < 0 && errno != ESRCH) {
+            return -1;
+        }
+        context->child_running = 1;
+    }
+    return 0;
+}
+
+/*
+ * task_context_socket_closed
+ * -----------------------
+ * Checks if the socket associated with a TaskContext has been closed by the client.
+ */
+static int task_context_socket_closed(int socket_fd) {
+    char peek;
+    ssize_t n = recv(socket_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+
+    if (n == 0) {
+        return 1;
+    }
+
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * send_response
+ * -----------------------
+ * Helper to send a structured response back to the client, including status and payload.
+ */
+static int send_response(int socket_fd, uint32_t status, const char *payload, size_t payload_size) {
+    uint32_t net_status = htonl(status);
+    uint32_t net_size = htonl((uint32_t) payload_size);
+
+    if (send_all(socket_fd, &net_status, sizeof(net_status)) != 0) {
+        return -1;
+    }
+
+    if (send_all(socket_fd, &net_size, sizeof(net_size)) != 0) {
+        return -1;
+    }
+
+    if (payload_size > 0 && send_all(socket_fd, payload, payload_size) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * scheduler_logger
+ * -----------------------
+ * Callback function for the scheduler to log task events such as enqueueing, dispatching, waiting, finishing, and cancellation.
+ */
+static void scheduler_logger(const char *event,
+                             const Task *task,
+                             int quantum,
+                             void *context) {
+    (void) context;
+    (void) quantum;
+
+    if (task == NULL) {
+        return;
+    }
+
+    if (strcmp(event, "enqueue") == 0) {
+        log_task_state(task, "created", task->remaining_burst);
+    } else if (strcmp(event, "dispatch") == 0) {
+        /* Only log "started" for first round, otherwise just dispatch happens */
+        if (task->rounds_completed == 0) {
+            log_task_state(task, "started", task->remaining_burst);
+        }
+    } else if (strcmp(event, "waiting") == 0) {
+        log_task_state(task, "waiting", task->remaining_burst);
+    } else if (strcmp(event, "finish") == 0) {
+        int ended_val = task->type == TASK_TYPE_SHELL ? -1 : task->remaining_burst;
+        size_t bytes_sent = 0;
+        if (task->user_data != NULL) {
+            TaskContext *ctx = (TaskContext *) task->user_data;
+            pthread_mutex_lock(&ctx->mutex);
+            bytes_sent = ctx->bytes_sent_total;
+            pthread_mutex_unlock(&ctx->mutex);
+        }
+        log_sent_and_ended(task->client_number, ended_val, bytes_sent);
+    } else if (strcmp(event, "cancel") == 0) {
+        int ended_val = task->type == TASK_TYPE_SHELL ? -1 : task->remaining_burst;
+        size_t bytes_sent = 0;
+        if (task->user_data != NULL) {
+            TaskContext *ctx = (TaskContext *) task->user_data;
+            pthread_mutex_lock(&ctx->mutex);
+            bytes_sent = ctx->bytes_sent_total;
+            pthread_mutex_unlock(&ctx->mutex);
+        }
+        log_sent_and_ended(task->client_number, ended_val, bytes_sent);
+    }
+}
+
+/*
+ * execute_shell_task
+ * -----------------------
+ * Executes a shell command task by invoking the shell execution function and capturing its output, then marking the task as done.
+ */
+static TaskRunResult execute_shell_task(Task *task, TaskContext *context) {
+    char *line_copy = duplicate_text(task->command_text);
+    char *captured_output = NULL;
+    size_t captured_size = 0;
+    int exit_requested;
+
+    if (line_copy == NULL) {
+        char *msg = duplicate_text("Failed to allocate shell command buffer.\n");
+        if (msg != NULL) {
+            task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+        }
+        return TASK_RUN_FAILED;
+    }
+
+    exit_requested = shell_execute_line_capture(line_copy, &captured_output, &captured_size);
+    free(line_copy);
+
+    if (captured_output == NULL) {
+        captured_output = duplicate_text("Failed to capture shell output.\n");
+        if (captured_output == NULL) {
+            return TASK_RUN_FAILED;
+        }
+        captured_size = strlen(captured_output);
+    }
+
+    task_context_set_done(context,
+                          exit_requested ? SERVER_EXIT : SERVER_CONTINUE,
+                          captured_output,
+                          captured_size);
+    return TASK_RUN_COMPLETE;
+}
+
+/*
+ * execute_program_task
+ * -----------------------
+ * Executes a program task by starting or resuming the child process, managing its execution within the given quantum, and handling preemption, cancellation, and output capture.
+ */
+static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *context) {
+    int slice;
+    int slices_run = 0;
+    int slice_end_timestamp = 0;
+
+    if (context->argv == NULL) {
+        char *msg = duplicate_text("Invalid program task.\n");
+        if (msg != NULL) {
+            task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+        }
+        return TASK_RUN_FAILED;
+    }
+
+    if (context->child_pid <= 0) {
+        if (task_context_start_child(context) != 0) {
+            char *msg = duplicate_text("Failed to start demo program.\n");
+            if (msg != NULL) {
+                task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+            }
+            return TASK_RUN_FAILED;
+        }
+    } else if (task_context_resume_child(context) != 0) {
+        char *msg = duplicate_text("Failed to resume demo program.\n");
+        if (msg != NULL) {
+            task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+        }
+        return TASK_RUN_FAILED;
+    }
+
+    /* Log running once at the start of this slice unless this is the very first start
+       (we print "started" from the logger for the first dispatch). */
+    if (task->rounds_completed > 0) {
+        log_task_state(task, "running", task->remaining_burst);
+    }
+
+    for (slice = 0; slice < quantum && task->remaining_burst > 0; slice++) {
+        int child_status;
+
+        if (scheduler_task_should_cancel(&scheduler, task) || task->cancel_requested) {
+            task_context_terminate_child(context);
+            /* Update timeline with actual slices run */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
+            }
+            return TASK_RUN_CANCELLED;
+        }
+
+        sleep(1);
+        slices_run++;
+
+        if (task_context_drain_pipe(context) != 0) {
+            task_context_terminate_child(context);
+            char *msg = duplicate_text("Failed while capturing program output.\n");
+            if (msg != NULL) {
+                task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+            }
+            /* Update timeline */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
+            }
+            return TASK_RUN_REQUEUE;
+        }
+
+        if (task->remaining_burst > 0) {
+            task->remaining_burst--;
+        }
+
+        if (context->child_pid > 0 && waitpid(context->child_pid, &child_status, WNOHANG) == context->child_pid) {
+            (void) child_status;
+            context->child_pid = -1;
+            context->child_running = 0;
+            task->remaining_burst = 0;
+
+            if (task_context_drain_pipe(context) != 0) {
+                char *msg = duplicate_text("Failed while capturing program output.\n");
+                if (msg != NULL) {
+                    task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+                }
+                /* Update timeline */
+                pthread_mutex_lock(&counter_mutex);
+                current_slice_start_time += slices_run;
+                pthread_mutex_unlock(&counter_mutex);
+                return TASK_RUN_FAILED;
+            }
+
+            /* Update timeline */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
+            }
+            task_context_set_done(context, SERVER_CONTINUE, context->output, context->output_size);
+            return TASK_RUN_COMPLETE;
+        }
+
+        if (scheduler_task_should_preempt(&scheduler, task)) {
+            task_context_stop_child(context);
+            if (task_context_drain_pipe(context) != 0) {
+                char *msg = duplicate_text("Failed while capturing program output.\n");
+                if (msg != NULL) {
+                    task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+                }
+                /* Update timeline */
+                pthread_mutex_lock(&counter_mutex);
+                current_slice_start_time += slices_run;
+                slice_end_timestamp = current_slice_start_time;
+                pthread_mutex_unlock(&counter_mutex);
+                if (slices_run > 0) {
+                    append_timeline_slice(task->client_number, slice_end_timestamp);
+                }
+                /* report waiting with updated remaining value */
+                return TASK_RUN_REQUEUE;
+            }
+            /* Update timeline */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            had_preemption = 1;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
+            }
+            return TASK_RUN_REQUEUE;
+        }
+    }
+
+    if (task->remaining_burst > 0) {
+        task_context_stop_child(context);
+        if (task_context_drain_pipe(context) != 0) {
+            char *msg = duplicate_text("Failed while capturing program output.\n");
+            if (msg != NULL) {
+                task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+            }
+            /* Update timeline */
+            pthread_mutex_lock(&counter_mutex);
+            current_slice_start_time += slices_run;
+            slice_end_timestamp = current_slice_start_time;
+            pthread_mutex_unlock(&counter_mutex);
+            if (slices_run > 0) {
+                append_timeline_slice(task->client_number, slice_end_timestamp);
+            }
+            return TASK_RUN_REQUEUE;
+        }
+        /* Update timeline */
+        pthread_mutex_lock(&counter_mutex);
+        current_slice_start_time += slices_run;
+        slice_end_timestamp = current_slice_start_time;
+        had_preemption = 1;
+        pthread_mutex_unlock(&counter_mutex);
+        if (slices_run > 0) {
+            append_timeline_slice(task->client_number, slice_end_timestamp);
+        }
+        return TASK_RUN_REQUEUE;
+    }
+
+    if (context->child_pid > 0) {
+        waitpid(context->child_pid, NULL, 0);
+        context->child_pid = -1;
+        context->child_running = 0;
+    }
+
+    if (task_context_drain_pipe(context) != 0) {
+        char *msg = duplicate_text("Failed while capturing program output.\n");
+        if (msg != NULL) {
+            task_context_set_done(context, SERVER_CONTINUE, msg, strlen(msg));
+        }
+        /* Update timeline */
+        pthread_mutex_lock(&counter_mutex);
+        current_slice_start_time += slices_run;
+        slice_end_timestamp = current_slice_start_time;
+        pthread_mutex_unlock(&counter_mutex);
+        if (slices_run > 0) {
+            append_timeline_slice(task->client_number, slice_end_timestamp);
+        }
+        return TASK_RUN_FAILED;
+    }
+
+    /* Update timeline */
+    pthread_mutex_lock(&counter_mutex);
+    current_slice_start_time += slices_run;
+    slice_end_timestamp = current_slice_start_time;
+    pthread_mutex_unlock(&counter_mutex);
+    if (slices_run > 0) {
+        append_timeline_slice(task->client_number, slice_end_timestamp);
+    }
+    task_context_set_done(context, SERVER_CONTINUE, context->output, context->output_size);
+    return TASK_RUN_COMPLETE;
+}
+
+/*
+ * print_summary_if_needed
+ * -----------------------
+ * Checks if a summary of task execution should be printed (if preemption occurred and we have timeline data), and prints it in a single line with ANSI color coding.
+ */
+static void print_summary_if_needed(void) {
+    pthread_mutex_lock(&counter_mutex);
+    
+    /* Only print if preemption occurred and we have timeline data */
+    if (had_preemption && timeline_count > 0) {
+        /* Build the timeline string like: (0)-P6-(3)-P7-(6)-P6-(13)-P7-(2) */
+        char timeline_str[1024];
+        timeline_str[0] = '\0';
+        strlcat(timeline_str, "(0)", sizeof(timeline_str));
+        int i;
+        for (i = 0; i < timeline_count; i++) {
+            char segment[64];
+            snprintf(segment, sizeof(segment), "P%d-(%d)",
+                     timeline[i].client_id, timeline[i].duration);
+            strlcat(timeline_str, "-", sizeof(timeline_str));
+            strlcat(timeline_str, segment, sizeof(timeline_str));
+        }
+
+        /* Print single-line summary with light blue (cyan) background */
+        log_line("\033[46m%s\033[0m\n", timeline_str);
+
+        /* Reset for next batch */
+        had_preemption = 0;
+        timeline_count = 0;
+        current_slice_start_time = 0;
+    }
+    
+    pthread_mutex_unlock(&counter_mutex);
+}
+
+/*
+ * server_task_executor
+ * -----------------------
+ * Main executor function for the scheduler that runs tasks based on their type, handling shell commands and program executions, and returning the appropriate status for the scheduler.
+ */
+static TaskRunResult server_task_executor(Task *task, int quantum, void *callback_context) {
+    TaskContext *context = task != NULL ? task->user_data : NULL;
+
+    (void) callback_context;
+
+    if (task == NULL || context == NULL) {
+        return TASK_RUN_FAILED;
+    }
+
+    if (task->type == TASK_TYPE_SHELL) {
+        return execute_shell_task(task, context);
+    }
+
+    return execute_program_task(task, quantum, context);
+}
+
+/*
+ * server_task_cleanup
+ * -----------------------
+ * Cleanup function for the scheduler to call when a task is finished or cancelled, ensuring that resources are released and final task info is stored for logging.
+ */
+static void server_task_cleanup(Task *task, void *callback_context) {
+    TaskContext *context = task != NULL ? task->user_data : NULL;
+
+    (void) callback_context;
+
+    if (context != NULL) {
+        /* Store final task info into context so client thread can log ended safely */
+        context->final_task_type = task->type;
+        context->final_remaining = task->remaining_burst;
+        task_context_release(context);
+    }
+
+    scheduler_destroy_task(task);
+}
+
+/*
+ * create_shell_task
+ * -----------------------
+ * Helper to create a shell command task with the given command and associate it with a TaskContext for tracking.
+ */
+static Task *create_shell_task(ClientContext *client, const char *command, TaskContext **context_out) {
+    TaskContext *context = task_context_create();
+    Task *task;
+
+    if (context == NULL) {
+        return NULL;
+    }
+
+    task = scheduler_create_task(TASK_TYPE_SHELL,
+                                 client->client_number,
+                                 command,
+                                 -1,
+                                 context);
+    if (task == NULL) {
+        task_context_release(context);
+        return NULL;
+    }
+
+    /* link context back to task for later logging */
+    context->task_ref = task;
+
+    *context_out = context;
+    return task;
+}
+
+/*
+ * create_program_task
+ * -----------------------
+ * Helper to create a program execution task based on a demo command, parsing the command for arguments and iterations, and associating it with a TaskContext for tracking.
+ */
+static Task *create_program_task(ClientContext *client,
+                                 const char *command,
+                                 TaskContext **context_out) {
+    int iterations;
+    char **argv;
+    TaskContext *context;
+    Task *task;
+
+    argv = build_demo_argv(command, &iterations);
+    if (argv == NULL) {
+        return NULL;
+    }
+
+    context = task_context_create();
+    if (context == NULL) {
+        free_string_array(argv);
+        return NULL;
+    }
+
+    context->argv = argv;
+    context->initial_burst = iterations;
+    context->socket_fd = client->socket_fd;
+
+    task = scheduler_create_task(TASK_TYPE_PROGRAM,
+                                 client->client_number,
+                                 command,
+                                 iterations,
+                                 context);
+    if (task == NULL) {
+        task_context_release(context);
+        return NULL;
+    }
+
+    /* link context back to task for later logging */
+    context->task_ref = task;
+
+    *context_out = context;
+    return task;
+}
+
+/*
+ * wait_for_task
+ * -----------------------
+ * Waits for a task to complete by waiting on its TaskContext's condition variable, while also checking for client disconnection to cancel the task if needed.
+ */
+static int wait_for_task(TaskContext *context, ClientContext *client) {
+    struct timeval tv;
+    struct timespec ts;
+
+    while (1) {
+        pthread_mutex_lock(&context->mutex);
+        if (context->done) {
+            pthread_mutex_unlock(&context->mutex);
+            return 0;
+        }
+
+        gettimeofday(&tv, NULL);
+        ts.tv_sec = tv.tv_sec;
+        ts.tv_nsec = (tv.tv_usec + 100000) * 1000;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+        }
+
+        (void) pthread_cond_timedwait(&context->ready, &context->mutex, &ts);
+        pthread_mutex_unlock(&context->mutex);
+
+        if (task_context_socket_closed(client->socket_fd)) {
+            scheduler_cancel_client_tasks(&scheduler, client->client_number);
+            return -1;
+        }
+    }
+}
+
+/*
+ * handle_task_response
+ * -----------------------
+ * Sends the response for a completed task back to the client, including the status and any output payload.
+ */
+static int handle_task_response(ClientContext *client, TaskContext *context) {
+    int status;
+    char *payload;
+    size_t payload_size;
+
+    pthread_mutex_lock(&context->mutex);
+    status = context->response_status;
+    payload = context->output;
+    payload_size = context->output_size;
+    pthread_mutex_unlock(&context->mutex);
+
+    if (send_response(client->socket_fd, (uint32_t) status, payload, payload_size) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * maybe_print_summary_when_idle
+ * -----------------------
+ * Checks if the scheduler is currently idle (no active tasks) and if so, prints a summary of recent task execution if needed.
+ */
+static void maybe_print_summary_when_idle(void) {
+    if (!scheduler_has_active_work(&scheduler)) {
+        print_summary_if_needed();
+    }
+}
+
+/*
  * handle_client
- * -------------
- * Detached worker thread that owns one client connection for the full
- * duration of that remote session.
+ * -----------------------
+ * Main loop for handling a connected client, receiving commands, creating tasks, waiting for their completion, and sending responses, while also handling disconnections and logging.
  */
 static void *handle_client(void *arg) {
     ClientContext *client = arg;
 
     while (1) {
-        ssize_t bytes_received;
         char command[BUFFER_SIZE];
-        char *captured_output = NULL;
-        size_t output_size = 0;
-        int exit_requested;
+        ssize_t recv_result;
 
         memset(command, 0, sizeof(command));
-        bytes_received = recv(client->socket_fd, command, sizeof(command) - 1, 0);
-        if (bytes_received < 0) {
-            pthread_mutex_lock(&log_mutex);
-            printf("[ERROR] ");
-            log_client_prefix(client);
-            printf(" recv failed: %s\n", strerror(errno));
-            fflush(stdout);
-            pthread_mutex_unlock(&log_mutex);
+        recv_result = recv_command(client->socket_fd, command, sizeof(command));
+        if (recv_result <= 0) {
+            scheduler_cancel_client_tasks(&scheduler, client->client_number);
+            log_disconnect(client, "client disconnected");
             break;
         }
 
-        if (bytes_received == 0) {
-            log_disconnect(client, "Client closed the connection.");
+        log_received(client, command);
+
+        if (strcmp(command, "exit") == 0) {
+            send_response(client->socket_fd, SERVER_EXIT, NULL, 0);
+            log_sent(client, 0);
+            log_disconnect(client, "client requested disconnect");
             break;
         }
 
-        pthread_mutex_lock(&log_mutex);
-        printf("[RECEIVED] ");
-        log_client_prefix(client);
-        printf(" Received command: \"%s\"\n", command);
-        printf("[EXECUTING] ");
-        log_client_prefix(client);
-        printf(" Executing command: \"%s\"\n", command);
-        fflush(stdout);
-        pthread_mutex_unlock(&log_mutex);
+        if (is_demo_command(command)) {
+            TaskContext *context = NULL;
+            Task *task = create_program_task(client, command, &context);
 
-        exit_requested = shell_execute_line_capture(command,
-                                                    &captured_output,
-                                                    &output_size);
+            if (task != NULL && context != NULL) {
+                if (scheduler_submit_task(&scheduler, task) < 0) {
+                    task_context_release(context);
+                    break;
+                }
 
-        pthread_mutex_lock(&log_mutex);
-        if (is_error_output(captured_output)) {
-            printf("[ERROR] ");
-            log_client_prefix(client);
-            printf(" ");
-            print_payload_inline(captured_output, output_size);
-            printf("[OUTPUT] ");
-            log_client_prefix(client);
-            printf(" Sending error message to client:\n");
-            print_payload_block(captured_output, output_size);
-        } else if (output_size > 0) {
-            printf("[OUTPUT] ");
-            log_client_prefix(client);
-            printf(" Sending output to client:\n");
-            print_payload_block(captured_output, output_size);
-        } else {
-            printf("[OUTPUT] ");
-            log_client_prefix(client);
-            printf(" Command produced no visible output.\n");
-        }
-        fflush(stdout);
-        pthread_mutex_unlock(&log_mutex);
+                if (wait_for_task(context, client) < 0) {
+                    task_context_release(context);
+                    break;
+                }
 
-        if (send_response(client->socket_fd,
-                          exit_requested ? SERVER_EXIT : SERVER_CONTINUE,
-                          captured_output,
-                          output_size) == -1) {
-            pthread_mutex_lock(&log_mutex);
-            printf("[ERROR] ");
-            log_client_prefix(client);
-            printf(" send failed: %s\n", strerror(errno));
-            fflush(stdout);
-            pthread_mutex_unlock(&log_mutex);
-            free(captured_output);
-            break;
+                if (handle_task_response(client, context) != 0) {
+                    task_context_release(context);
+                    break;
+                }
+
+                maybe_print_summary_when_idle();
+
+                task_context_release(context);
+                continue;
+            }
         }
 
-        free(captured_output);
+        {
+            TaskContext *context = NULL;
+            Task *task = create_shell_task(client, command, &context);
 
-        if (exit_requested) {
-            log_disconnect(client, "Client requested disconnect. Closing connection.");
-            break;
+            if (task == NULL || context == NULL) {
+                break;
+            }
+
+            if (scheduler_submit_task(&scheduler, task) < 0) {
+                task_context_release(context);
+                break;
+            }
+
+            if (wait_for_task(context, client) < 0) {
+                task_context_release(context);
+                break;
+            }
+
+            if (handle_task_response(client, context) != 0) {
+                task_context_release(context);
+                break;
+            }
+
+            maybe_print_summary_when_idle();
+
+            task_context_release(context);
         }
     }
 
@@ -357,34 +1324,48 @@ static void *handle_client(void *arg) {
 
 /*
  * main
- * ----
- * Phase 3 server entry point.
- *
- * Responsibilities in this branch:
- *   1. Create, bind, and listen on a TCP socket
- *   2. Accept clients continuously
- *   3. Spawn one detached thread per client session
- *   4. Reuse the shared shell execution path for each command
- *   5. Log every incoming and outgoing event with client identity
+ * -----------------------
+ * Entry point of the server application, setting up the scheduler, initializing the server socket, accepting client connections, and spawning threads to handle each client.
  */
 int main(void) {
     int opt = 1;
     int server_socket;
     struct sockaddr_in server_address;
+    SchedulerConfig config = {3, 7, DEMO_DEFAULT_BURST};
+
+    if (scheduler_init(&scheduler,
+                       &config,
+                       server_task_executor,
+                       server_task_cleanup,
+                       scheduler_logger,
+                       &scheduler) != 0) {
+        fprintf(stderr, "[ERROR] Failed to initialize scheduler.\n");
+        return EXIT_FAILURE;
+    }
+
+    if (scheduler_start(&scheduler) != 0) {
+        fprintf(stderr, "[ERROR] Failed to start scheduler thread.\n");
+        scheduler_destroy(&scheduler);
+        return EXIT_FAILURE;
+    }
+
+    scheduler_started = 1;
 
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket == -1) {
         perror("socket");
+        scheduler_request_stop(&scheduler);
+        scheduler_join(&scheduler);
+        scheduler_destroy(&scheduler);
         return EXIT_FAILURE;
     }
 
-    if (setsockopt(server_socket,
-                   SOL_SOCKET,
-                   SO_REUSEADDR,
-                   &opt,
-                   sizeof(opt)) < 0) {
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("setsockopt");
         close(server_socket);
+        scheduler_request_stop(&scheduler);
+        scheduler_join(&scheduler);
+        scheduler_destroy(&scheduler);
         return EXIT_FAILURE;
     }
 
@@ -393,34 +1374,37 @@ int main(void) {
     server_address.sin_port = htons(PORT);
     server_address.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_socket,
-             (struct sockaddr *) &server_address,
-             sizeof(server_address)) < 0) {
+    if (bind(server_socket, (struct sockaddr *) &server_address, sizeof(server_address)) < 0) {
         perror("bind");
         close(server_socket);
+        scheduler_request_stop(&scheduler);
+        scheduler_join(&scheduler);
+        scheduler_destroy(&scheduler);
         return EXIT_FAILURE;
     }
 
     if (listen(server_socket, BACKLOG) < 0) {
         perror("listen");
         close(server_socket);
+        scheduler_request_stop(&scheduler);
+        scheduler_join(&scheduler);
+        scheduler_destroy(&scheduler);
         return EXIT_FAILURE;
     }
 
-    printf("[INFO] Server started, waiting for client connections...\n");
-    fflush(stdout);
+    log_line("------------------------------\n");
+    log_line("| Hello, Server Started |\n");
+    log_line("------------------------------\n");
 
     while (1) {
+        ClientContext *client = malloc(sizeof(*client));
         int client_socket;
         socklen_t client_length;
         pthread_t thread_id;
-        ClientContext *client;
 
-        client = malloc(sizeof(*client));
         if (client == NULL) {
             perror("malloc");
-            close(server_socket);
-            return EXIT_FAILURE;
+            break;
         }
 
         client_length = sizeof(client->address);
@@ -457,5 +1441,12 @@ int main(void) {
     }
 
     close(server_socket);
+
+    if (scheduler_started) {
+        scheduler_request_stop(&scheduler);
+        scheduler_join(&scheduler);
+        scheduler_destroy(&scheduler);
+    }
+
     return EXIT_SUCCESS;
 }

@@ -42,6 +42,14 @@
 #define SERVER_EXIT 1U
 
 /*
+ * SERVER_PROGRESS
+ * ---------------
+ * Status flag used for intermediate progress packets streamed while a
+ * long-running demo command is still executing.
+ */
+#define SERVER_PROGRESS 2U
+
+/*
  * send_all
  * --------
  * Retries send() until the full buffer has been transmitted or an
@@ -115,32 +123,53 @@ static int receive_response(int socket_fd,
     *server_reply = NULL;
     *reply_size = 0;
 
-    if (recv_all(socket_fd, &network_status, sizeof(network_status)) == -1) {
-        return -1;
-    }
+    while (1) {
+        char *payload;
+        size_t payload_size;
+        uint32_t packet_status;
 
-    if (recv_all(socket_fd,
-                 &network_reply_size,
-                 sizeof(network_reply_size)) == -1) {
-        return -1;
-    }
+        if (recv_all(socket_fd, &network_status, sizeof(network_status)) == -1) {
+            return -1;
+        }
 
-    *server_status = ntohl(network_status);
-    *reply_size = (size_t) ntohl(network_reply_size);
-    *server_reply = malloc(*reply_size + 1);
-    if (*server_reply == NULL) {
-        return -1;
-    }
+        if (recv_all(socket_fd,
+                     &network_reply_size,
+                     sizeof(network_reply_size)) == -1) {
+            return -1;
+        }
 
-    if (*reply_size > 0 &&
-        recv_all(socket_fd, *server_reply, *reply_size) == -1) {
-        free(*server_reply);
-        *server_reply = NULL;
-        return -1;
-    }
+        packet_status = ntohl(network_status);
+        payload_size = (size_t) ntohl(network_reply_size);
+        payload = malloc(payload_size + 1);
+        if (payload == NULL) {
+            return -1;
+        }
 
-    (*server_reply)[*reply_size] = '\0';
-    return 0;
+        if (payload_size > 0 &&
+            recv_all(socket_fd, payload, payload_size) == -1) {
+            free(payload);
+            return -1;
+        }
+
+        payload[payload_size] = '\0';
+
+        if (packet_status == SERVER_PROGRESS) {
+            if (payload_size > 0) {
+                fwrite(payload, 1, payload_size, stdout);
+                if (payload[payload_size - 1] != '\n') {
+                    printf("\n");
+                }
+                fflush(stdout);
+            }
+            free(payload);
+            continue;
+        }
+
+        *server_status = packet_status;
+        *reply_size = payload_size;
+        *server_reply = payload;
+        return 0;
+    }
 }
 
 /*
@@ -210,6 +239,9 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
+    printf("Connected to a server\n");
+    fflush(stdout);
+
     while (1) {
         char *server_reply;
         size_t reply_size;
@@ -219,7 +251,7 @@ int main(void) {
          * Re-prompt after every completed round trip so the remote
          * client behaves like an interactive shell session.
          */
-        printf("$ ");
+        printf(">>> ");
         fflush(stdout);
 
         if (fgets(command, sizeof(command), stdin) == NULL) {

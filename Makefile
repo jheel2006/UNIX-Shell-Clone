@@ -21,11 +21,17 @@ SERVER_OBJ = $(SERVER_SRC:.c=.o)
 SCHEDULER_TEST_SRC = src/scheduler_test.c
 SCHEDULER_TEST_OBJ = $(SCHEDULER_TEST_SRC:.c=.o)
 
-TARGETS = myshell client server scheduler_test
+DEMO_SRC = src/demo.c
+DEMO_OBJ = $(DEMO_SRC:.c=.o)
+
+TARGETS = myshell client server scheduler_test demo
 
 .PHONY: all clean
 
 all: $(TARGETS)
+
+demo: $(DEMO_OBJ)
+	$(CC) $(CFLAGS) $(DEMO_OBJ) -o demo
 
 myshell: $(CORE_OBJ) $(SHELL_OBJ)
 	$(CC) $(CFLAGS) $(CORE_OBJ) $(SHELL_OBJ) -o myshell
