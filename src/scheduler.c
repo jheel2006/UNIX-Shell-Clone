@@ -77,6 +77,9 @@ static void enqueue_task_locked(Scheduler *scheduler, Task *task) {
  * choose_shortest_program_locked
  * ------------------------------
  * Selects the shortest remaining program task.
+ * This is the SJRF part of the Phase 4 scheduler. We keep both the best
+ * task and a backup task, because the assignment says the same process
+ * should not be chosen twice in a row unless it is the only one waiting.
  *
  * The caller must already hold scheduler->mutex.
  */
@@ -111,7 +114,11 @@ static Task *choose_shortest_program_locked(Scheduler *scheduler) {
         cursor = cursor->next;
     }
 
-    /* Fairness: avoid selecting the exact same program twice in a row when another is available */
+    /*
+     * Fairness rule: avoid selecting the exact same program twice in a
+     * row when another one is available, even if the first task is still
+     * technically the shortest.
+     */
     if (best != NULL &&
         best->task_id == scheduler->last_selected_task_id &&
         best_alt != NULL) {
@@ -144,6 +151,8 @@ static Task *choose_shortest_program_locked(Scheduler *scheduler) {
  *   1. shell commands always win immediately
  *   2. otherwise choose the shortest remaining program
  *   3. avoid selecting the same program twice in a row when possible
+ * This keeps simple shell commands responsive while still letting demo
+ * processes share the simualted CPU.
  *
  * The caller must already hold scheduler->mutex.
  */
@@ -179,6 +188,8 @@ static Task *dequeue_next_task_locked(Scheduler *scheduler) {
  * -----------------------------
  * New shell tasks always preempt a running program. New programs may
  * preempt only when their remaining burst time is shorter.
+ * The executor checks this flag between one-second ticks, so preemption
+ * happens at clean points instead of in the middle of captured output.
  *
  * The caller must already hold scheduler->mutex.
  */

@@ -75,7 +75,7 @@ static char *duplicate_text(const char *text) {
 /*
  * shell_execute_line
  * ------------------
- * Reuses the Phase 1 parser and executors for a single command line.
+ * Reuses the Phase 4 parser and executors for a single command line.
  * This function is intentionally front-end agnostic so both the local
  * shell and the remote server can drive the exact same execution path.
  *
@@ -116,6 +116,8 @@ int shell_execute_line(char *line) {
  * Runs the same shared shell execution path as shell_execute_line(),
  * but temporarily redirects stdout and stderr to a temporary file so
  * the server can send the resulting output back to the remote client.
+ * This is used for shell commands, not demo scheduling, because a shell
+ * command is expected to finish in one schedulable round.
  *
  * Using a temporary file keeps this capture path simple and avoids
  * pipe-buffer deadlocks when a command prints more than one small chunk
