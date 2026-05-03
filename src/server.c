@@ -437,6 +437,116 @@ static char **build_demo_argv(const char *command, int *iterations_out) {
     return argv;
 }
 
+/* Forward declarations */
+static TaskContext *task_context_create(void);
+static void task_context_release(TaskContext *context);
+
+/*
+ * is_program_command
+ * -----------------------
+ * Detects whether a command string should be treated as a program execution
+ * request (not a shell builtin). For now we treat commands that start with
+ * "./" or "/" as program executions.
+ */
+static int is_program_command(const char *command) {
+    if (command == NULL) return 0;
+    return (command[0] == '/' || (command[0] == '.' && command[1] == '/'));
+}
+
+/*
+ * split_command_argv
+ * -----------------------
+ * Splits a raw command string into a NULL-terminated argv array suitable
+ * for execvp. The caller must free the returned array with free_string_array().
+ */
+static char **split_command_argv(const char *command) {
+    char *copy = NULL;
+    char *saveptr = NULL;
+    char *token;
+    char **argv = NULL;
+    int argc = 0;
+    int capacity = 4;
+
+    if (command == NULL) return NULL;
+
+    copy = duplicate_text(command);
+    if (copy == NULL) return NULL;
+
+    argv = calloc((size_t) capacity, sizeof(char *));
+    if (argv == NULL) {
+        free(copy);
+        return NULL;
+    }
+
+    token = strtok_r(copy, " \t", &saveptr);
+    while (token != NULL) {
+        if (argc + 1 >= capacity) {
+            int newcap = capacity * 2;
+            char **resized = realloc(argv, (size_t)newcap * sizeof(char *));
+            if (resized == NULL) {
+                free_string_array(argv);
+                free(copy);
+                return NULL;
+            }
+            argv = resized;
+            capacity = newcap;
+        }
+
+        argv[argc] = duplicate_text(token);
+        if (argv[argc] == NULL) {
+            free_string_array(argv);
+            free(copy);
+            return NULL;
+        }
+        argc++;
+        token = strtok_r(NULL, " \t", &saveptr);
+    }
+
+    argv[argc] = NULL;
+    free(copy);
+    return argv;
+}
+
+/*
+ * create_generic_program_task
+ * -----------------------
+ * Create a TASK_TYPE_PROGRAM from an arbitrary command string by tokenizing
+ * into argv and assigning a default burst estimate.
+ */
+static Task *create_generic_program_task(ClientContext *client, const char *command, TaskContext **context_out) {
+    char **argv = NULL;
+    TaskContext *context = NULL;
+    Task *task = NULL;
+    int default_burst = DEMO_DEFAULT_BURST;
+
+    argv = split_command_argv(command);
+    if (argv == NULL) return NULL;
+
+    context = task_context_create();
+    if (context == NULL) {
+        free_string_array(argv);
+        return NULL;
+    }
+
+    context->argv = argv;
+    context->initial_burst = default_burst;
+    context->socket_fd = client->socket_fd;
+
+    task = scheduler_create_task(TASK_TYPE_PROGRAM,
+                                 client->client_number,
+                                 command,
+                                 default_burst,
+                                 context);
+    if (task == NULL) {
+        task_context_release(context);
+        return NULL;
+    }
+
+    context->task_ref = task;
+    *context_out = context;
+    return task;
+}
+
 /*
  * task_context_create
  * -----------------------
@@ -1311,6 +1421,34 @@ static void *handle_client(void *arg) {
         if (is_demo_command(command)) {
             TaskContext *context = NULL;
             Task *task = create_program_task(client, command, &context);
+
+            if (task != NULL && context != NULL) {
+                if (scheduler_submit_task(&scheduler, task) < 0) {
+                    task_context_release(context);
+                    break;
+                }
+
+                if (wait_for_task(context, client) < 0) {
+                    task_context_release(context);
+                    break;
+                }
+
+                if (handle_task_response(client, context) != 0) {
+                    task_context_release(context);
+                    break;
+                }
+
+                maybe_print_summary_when_idle();
+
+                task_context_release(context);
+                continue;
+            }
+        }
+
+        /* Treat explicit program invocations (./prog or /bin/prog) as scheduled program tasks */
+        if (is_program_command(command)) {
+            TaskContext *context = NULL;
+            Task *task = create_generic_program_task(client, command, &context);
 
             if (task != NULL && context != NULL) {
                 if (scheduler_submit_task(&scheduler, task) < 0) {
