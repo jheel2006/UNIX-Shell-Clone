@@ -152,6 +152,31 @@ static char *duplicate_text(const char *text) {
 }
 
 /*
+ * append_text
+ * -----------------------
+ * Portable bounded appending helper. Linux/glibc does not provide the
+ * same BSD helper functions by default, so this keeps summary formatting
+ * compatible with the required remote Linux server.
+ */
+static void append_text(char *destination, size_t destination_size, const char *source) {
+    size_t used;
+    size_t available;
+
+    if (destination == NULL || source == NULL || destination_size == 0) {
+        return;
+    }
+
+    used = strlen(destination);
+    if (used >= destination_size - 1) {
+        destination[destination_size - 1] = '\0';
+        return;
+    }
+
+    available = destination_size - used - 1;
+    strncat(destination, source, available);
+}
+
+/*
  * free string array
  * -----------------------
  * Helper to free a null-terminated array of strings, used for demo command parsing.
@@ -188,7 +213,9 @@ static void log_line(const char *fmt, ...) {
 /*
  * log_connection_open
  * -----------------------
- * Logs when a new client connection is established, including the client's IP and port.
+ * Logs when a new client connection is established. The display keeps the
+ * same compact format as the sample screenshots, while the address fields
+ * are still read here in case we want a more detailed debug line later.
  */
 static void log_connection_open(const ClientContext *client) {
     char ip_address[INET_ADDRSTRLEN];
@@ -283,6 +310,8 @@ static void log_task_state(const Task *task, const char *state, int value) {
  * append_timeline_slice
  * -----------------------
  * Helper to track execution slices for summary printing.
+ * Each slice stores the client id and the cumulative time where that
+ * scheduled turn ended, which is what the final gantt-style line shows.
  */
 static void append_timeline_slice(int client_id, int end_timestamp) {
     pthread_mutex_lock(&counter_mutex);
@@ -295,9 +324,10 @@ static void append_timeline_slice(int client_id, int end_timestamp) {
 }
 
 /*
- * print_summary_if_needed
+ * is_demo_command
  * -----------------------
- * Prints the execution summary if all tasks have completed.
+ * Checks whether a client command should go through the Phase 4 scheduled
+ * demo path instead of the normal shell-command path.
  */
 static int is_demo_command(const char *command) {
     return command != NULL &&
@@ -311,6 +341,8 @@ static int is_demo_command(const char *command) {
  * build_demo_argv
  * -----------------------
  * Parses a demo command and builds an argv array for execution, also extracting the iteration count.
+ * "demo 12" is normalized to "./demo 12" so users can type either form
+ * from the client terminal during the presentation.
  */
 static char **build_demo_argv(const char *command, int *iterations_out) {
     char *copy;
@@ -813,6 +845,9 @@ static TaskRunResult execute_shell_task(Task *task, TaskContext *context) {
  * execute_program_task
  * -----------------------
  * Executes a program task by starting or resuming the child process, managing its execution within the given quantum, and handling preemption, cancellation, and output capture.
+ * The child process is paused with SIGSTOP when the quantum ends or a
+ * shorter task arrives, then continued later with SIGCONT. That is how the
+ * demo keeps moving from the point it stopped instead of restarting.
  */
 static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *context) {
     int slice;
@@ -843,12 +878,20 @@ static TaskRunResult execute_program_task(Task *task, int quantum, TaskContext *
         return TASK_RUN_FAILED;
     }
 
-    /* Log running once at the start of this slice unless this is the very first start
-       (we print "started" from the logger for the first dispatch). */
+    /*
+     * Log running once at the start of this slice unless this is the very
+     * first start. The first dispatch uses "started" so the server output
+     * looks close to the required screenshots.
+     */
     if (task->rounds_completed > 0) {
         log_task_state(task, "running", task->remaining_burst);
     }
 
+    /*
+     * One loop iteration is one scheduler time unit. After each second we
+     * drain any output the child printed, decrement the remaining burst,
+     * then check whether the process finished or needs to be preempted.
+     */
     for (slice = 0; slice < quantum && task->remaining_burst > 0; slice++) {
         int child_status;
 
@@ -1026,14 +1069,14 @@ static void print_summary_if_needed(void) {
         /* Build the timeline string like: (0)-P6-(3)-P7-(6)-P6-(13)-P7-(2) */
         char timeline_str[1024];
         timeline_str[0] = '\0';
-        strlcat(timeline_str, "(0)", sizeof(timeline_str));
+        append_text(timeline_str, sizeof(timeline_str), "(0)");
         int i;
         for (i = 0; i < timeline_count; i++) {
             char segment[64];
             snprintf(segment, sizeof(segment), "P%d-(%d)",
                      timeline[i].client_id, timeline[i].duration);
-            strlcat(timeline_str, "-", sizeof(timeline_str));
-            strlcat(timeline_str, segment, sizeof(timeline_str));
+            append_text(timeline_str, sizeof(timeline_str), "-");
+            append_text(timeline_str, sizeof(timeline_str), segment);
         }
 
         /* Print single-line summary with light blue (cyan) background */
@@ -1093,6 +1136,8 @@ static void server_task_cleanup(Task *task, void *callback_context) {
  * create_shell_task
  * -----------------------
  * Helper to create a shell command task with the given command and associate it with a TaskContext for tracking.
+ * Shell tasks use burst -1 so the scheduler can give them priority over
+ * regular demo work, matching the project notes.
  */
 static Task *create_shell_task(ClientContext *client, const char *command, TaskContext **context_out) {
     TaskContext *context = task_context_create();
@@ -1123,6 +1168,8 @@ static Task *create_shell_task(ClientContext *client, const char *command, TaskC
  * create_program_task
  * -----------------------
  * Helper to create a program execution task based on a demo command, parsing the command for arguments and iterations, and associating it with a TaskContext for tracking.
+ * The burst estimate comes from the N value in "./demo N", so the SJRF
+ * selector has a simple number to compare between clients.
  */
 static Task *create_program_task(ClientContext *client,
                                  const char *command,

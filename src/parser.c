@@ -367,7 +367,7 @@ Pipeline* parse_line(char *line) {
 
         /*
          * Reject segments that contain only redirections and no command.
-         * We treat this as a pipe syntax error in the current phase rules.
+         * We treat this as a pipe syntax error in the Phase 4 rules.
          */
         if (argc == 0) {
             /*

@@ -5,19 +5,19 @@
 
 /*
  * Shared shell entry points reused by the local shell now and
- * by the remote server implementation in Phase 2.
+ * by the remote server implementation in Phase 4.
  */
 int shell_run_interactive(void);
 
 /*
- * Executes one command line using the shared Phase 1 parser and
+ * Executes one command line using the shared Phase 4 parser and
  * executor pipeline. Returns 1 only when the caller should treat
  * the line as an "exit" request; otherwise returns 0.
  */
 int shell_execute_line(char *line);
 
 /*
- * Executes one command line through the same shared Phase 1 shell path
+ * Executes one command line through the same shared Phase 4 shell path
  * while capturing both stdout and stderr into a heap buffer.
  *
  * On success:

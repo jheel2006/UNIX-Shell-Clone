@@ -45,7 +45,8 @@
  * SERVER_PROGRESS
  * ---------------
  * Status flag used for intermediate progress packets streamed while a
- * long-running demo command is still executing.
+ * long-running demo command is still executing. The client prints these
+ * packets right away instead of waiting for the whole task to finish.
  */
 #define SERVER_PROGRESS 2U
 
@@ -108,6 +109,8 @@ static int recv_all(int socket_fd, void *buffer, size_t length) {
  *   3. payload bytes (command output / error text)
  *
  * The caller owns *server_reply and must free it.
+ * Progress packets are handled inside this function so the main loop
+ * still feels like a normal request/response shell.
  */
 static int receive_response(int socket_fd,
                             uint32_t *server_status,
@@ -189,7 +192,7 @@ static void trim_newline(char *text) {
 /*
  * main
  * ----
- * Phase 2 client for the persistent-session milestone.
+ * Phase 4 client for the scheduler milestone.
  *
  * Responsibilities in this branch:
  *   1. Create a TCP socket
@@ -198,7 +201,8 @@ static void trim_newline(char *text) {
  *   4. Read one command at a time and send it to the server
  *   5. Receive one response packet per command
  *   6. Print returned output/error text exactly
- *   7. Stop only when the server signals session exit or input ends
+ *   7. Print recieved progress packets from scheduled demo tasks
+ *   8. Stop only when the server signals session exit or input ends
  */
 int main(void) {
     int network_socket;
@@ -273,7 +277,9 @@ int main(void) {
         /*
          * Receive one complete response packet for this command.
          * The status flag tells the client whether to continue the
-         * session or exit after printing the returned payload.
+         * session or exit after printing the returned payload. For
+         * scheduled demo programs, receive_response() may print several
+         * progress packets before returning this final packet.
          */
         if (receive_response(network_socket,
                              &server_status,
